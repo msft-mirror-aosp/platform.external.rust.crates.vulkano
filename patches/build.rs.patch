@@ -1,0 +1,13 @@
+diff --git a/build.rs b/build.rs
+index 1f2b2bf5..4da24a10 100644
+--- a/build.rs
++++ b/build.rs
+@@ -7,6 +7,8 @@
+ // notice may not be copied, modified, or distributed except
+ // according to those terms.
+ 
++#![feature(str_split_once)]
++
+ use std::{env, fs::File, io::BufWriter, path::Path};
+ 
+ mod autogen;
