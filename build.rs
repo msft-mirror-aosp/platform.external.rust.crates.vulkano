@@ -7,8 +7,6 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-#![feature(str_split_once)]
-
 use std::{env, fs::File, io::BufWriter, path::Path};
 
 mod autogen;
