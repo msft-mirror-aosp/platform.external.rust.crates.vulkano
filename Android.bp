@@ -46,7 +46,6 @@ genrule {
 
 rust_library {
     name: "libvulkano",
-    // has rustc warnings
     host_supported: true,
     crate_name: "vulkano",
     cargo_env_compat: true,
@@ -72,18 +71,21 @@ rust_library {
     ],
 }
 
-rust_defaults {
-    name: "vulkano_test_defaults",
+rust_test {
+    name: "vulkano_test_src_lib",
+    host_supported: true,
     crate_name: "vulkano",
-    // has rustc warnings
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.25.0",
     srcs: [
         "src/lib.rs",
         ":copy_vulkano_build_out",
     ],
-    cargo_env_compat: true,
-    cargo_pkg_version: "0.25.0",
     test_suites: ["general-tests"],
     auto_gen_config: true,
+    test_options: {
+        unit_test: false,
+    },
     edition: "2018",
     rustlibs: [
         "libash_rust",
@@ -95,19 +97,4 @@ rust_defaults {
         "libshared_library",
         "libsmallvec",
     ],
-}
-
-rust_test_host {
-    name: "vulkano_host_test_src_lib",
-    defaults: ["vulkano_test_defaults"],
-    // Manually disabled as these tests depend on specific graphics libraries
-    // being available on the machine running the tests.
-    test_options: {
-        unit_test: false,
-    },
-}
-
-rust_test {
-    name: "vulkano_device_test_src_lib",
-    defaults: ["vulkano_test_defaults"],
 }
