@@ -7,110 +7,47 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use crate::buffer::BufferAccess;
-use crate::buffer::BufferUsage;
-use crate::buffer::CpuAccessibleBuffer;
-use crate::buffer::TypedBufferAccess;
-use crate::command_buffer::AutoCommandBufferBuilder;
-use crate::command_buffer::CommandBufferExecFuture;
-use crate::command_buffer::CommandBufferUsage;
-use crate::command_buffer::PrimaryAutoCommandBuffer;
-use crate::command_buffer::PrimaryCommandBuffer;
-use crate::device::physical::QueueFamily;
-use crate::device::Device;
-use crate::device::Queue;
-use crate::format::Format;
-use crate::format::Pixel;
-use crate::image::sys::ImageCreationError;
-use crate::image::sys::UnsafeImage;
-use crate::image::traits::ImageAccess;
-use crate::image::traits::ImageContent;
-use crate::image::ImageCreateFlags;
-use crate::image::ImageDescriptorLayouts;
-use crate::image::ImageDimensions;
-use crate::image::ImageInner;
-use crate::image::ImageLayout;
-use crate::image::ImageUsage;
-use crate::image::MipmapsCount;
-use crate::image::SampleCount;
-use crate::memory::pool::AllocFromRequirementsFilter;
-use crate::memory::pool::AllocLayout;
-use crate::memory::pool::MappingRequirement;
-use crate::memory::pool::MemoryPool;
-use crate::memory::pool::MemoryPoolAlloc;
-use crate::memory::pool::PotentialDedicatedAllocation;
-use crate::memory::pool::StdMemoryPoolAlloc;
-use crate::memory::DedicatedAlloc;
-use crate::sampler::Filter;
-use crate::sync::AccessError;
-use crate::sync::NowFuture;
-use crate::sync::Sharing;
-use smallvec::SmallVec;
-use std::hash::Hash;
-use std::hash::Hasher;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use super::{
+    sys::{Image, RawImage},
+    traits::ImageContent,
+    ImageAccess, ImageCreateFlags, ImageDescriptorLayouts, ImageDimensions, ImageError, ImageInner,
+    ImageLayout, ImageSubresourceLayers, ImageUsage, MipmapsCount,
+};
+use crate::{
+    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferError, BufferUsage, Subbuffer},
+    command_buffer::{
+        allocator::CommandBufferAllocator, AutoCommandBufferBuilder, BlitImageInfo,
+        BufferImageCopy, CommandBufferBeginError, CopyBufferToImageInfo, ImageBlit,
+    },
+    device::{Device, DeviceOwned},
+    format::Format,
+    image::sys::ImageCreateInfo,
+    memory::{
+        allocator::{
+            AllocationCreateInfo, AllocationCreationError, AllocationType,
+            MemoryAllocatePreference, MemoryAllocator, MemoryUsage,
+        },
+        is_aligned, DedicatedAllocation,
+    },
+    sampler::Filter,
+    sync::Sharing,
+    DeviceSize, VulkanError,
+};
+use smallvec::{smallvec, SmallVec};
+use std::{
+    error::Error,
+    fmt::{Display, Error as FmtError, Formatter},
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 /// Image whose purpose is to be used for read-only purposes. You can write to the image once,
 /// but then you must only ever read from it.
 // TODO: type (2D, 3D, array, etc.) as template parameter
 #[derive(Debug)]
-pub struct ImmutableImage<A = PotentialDedicatedAllocation<StdMemoryPoolAlloc>> {
-    image: UnsafeImage,
-    dimensions: ImageDimensions,
-    memory: A,
-    format: Format,
-    initialized: AtomicBool,
+pub struct ImmutableImage {
+    inner: Arc<Image>,
     layout: ImageLayout,
-}
-
-/// Image whose purpose is to access only a part of one image, for any kind of access
-/// We define a part of one image here by a level of mipmap, or a layer of an array
-/// The image attribute must be an implementation of ImageAccess
-/// The mip_levels_access must be a range showing which mipmaps will be accessed
-/// The layer_levels_access must be a range showing which layers will be accessed
-/// The layout must be the layout of the image at the beginning and at the end of the command buffer
-pub struct SubImage {
-    image: Arc<dyn ImageAccess + Sync + Send>,
-    mip_levels_access: std::ops::Range<u32>,
-    layer_levels_access: std::ops::Range<u32>,
-    layout: ImageLayout,
-}
-
-impl SubImage {
-    pub fn new(
-        image: Arc<dyn ImageAccess + Sync + Send>,
-        mip_level: u32,
-        mip_level_count: u32,
-        layer_level: u32,
-        layer_level_count: u32,
-        layout: ImageLayout,
-    ) -> Arc<SubImage> {
-        debug_assert!(mip_level + mip_level_count <= image.mipmap_levels());
-        debug_assert!(layer_level + layer_level_count <= image.dimensions().array_layers());
-
-        let last_level = mip_level + mip_level_count;
-        let mip_levels_access = mip_level..last_level;
-
-        let last_level = layer_level + layer_level_count;
-        let layer_levels_access = layer_level..last_level;
-
-        Arc::new(SubImage {
-            image,
-            mip_levels_access,
-            layer_levels_access,
-            layout: ImageLayout::ShaderReadOnlyOptimal,
-        })
-    }
-}
-
-// Must not implement Clone, as that would lead to multiple `used` values.
-pub struct ImmutableImageInitialization<A = PotentialDedicatedAllocation<StdMemoryPoolAlloc>> {
-    image: Arc<ImmutableImage<A>>,
-    used: AtomicBool,
-    mip_levels_access: std::ops::Range<u32>,
-    layer_levels_access: std::ops::Range<u32>,
 }
 
 fn has_mipmaps(mipmaps: MipmapsCount) -> bool {
@@ -121,337 +58,274 @@ fn has_mipmaps(mipmaps: MipmapsCount) -> bool {
     }
 }
 
-fn generate_mipmaps<L, Img>(
-    cbb: &mut AutoCommandBufferBuilder<L>,
-    image: Arc<Img>,
+fn generate_mipmaps<L, Cba>(
+    cbb: &mut AutoCommandBufferBuilder<L, Cba>,
+    image: Arc<dyn ImageAccess>,
     dimensions: ImageDimensions,
-    layout: ImageLayout,
+    _layout: ImageLayout,
 ) where
-    Img: ImageAccess + Send + Sync + 'static,
+    Cba: CommandBufferAllocator,
 {
-    for level in 1..image.mipmap_levels() {
-        let [xs, ys, ds] = dimensions
-            .mipmap_dimensions(level - 1)
+    for level in 1..image.mip_levels() {
+        let src_size = dimensions
+            .mip_level_dimensions(level - 1)
             .unwrap()
             .width_height_depth();
-        let [xd, yd, dd] = dimensions
-            .mipmap_dimensions(level)
+        let dst_size = dimensions
+            .mip_level_dimensions(level)
             .unwrap()
             .width_height_depth();
 
-        let src = SubImage::new(
-            image.clone(),
-            level - 1,
-            1,
-            0,
-            dimensions.array_layers(),
-            layout,
-        );
-
-        let dst = SubImage::new(
-            image.clone(),
-            level,
-            1,
-            0,
-            dimensions.array_layers(),
-            layout,
-        );
-
-        cbb.blit_image(
-            src,                               //source
-            [0, 0, 0],                         //source_top_left
-            [xs as i32, ys as i32, ds as i32], //source_bottom_right
-            0,                                 //source_base_array_layer
-            level - 1,                         //source_mip_level
-            dst,                               //destination
-            [0, 0, 0],                         //destination_top_left
-            [xd as i32, yd as i32, dd as i32], //destination_bottom_right
-            0,                                 //destination_base_array_layer
-            level,                             //destination_mip_level
-            1,                                 //layer_count
-            Filter::Linear,                    //filter
-        )
+        cbb.blit_image(BlitImageInfo {
+            regions: [ImageBlit {
+                src_subresource: ImageSubresourceLayers {
+                    mip_level: level - 1,
+                    ..image.subresource_layers()
+                },
+                src_offsets: [[0; 3], src_size],
+                dst_subresource: ImageSubresourceLayers {
+                    mip_level: level,
+                    ..image.subresource_layers()
+                },
+                dst_offsets: [[0; 3], dst_size],
+                ..Default::default()
+            }]
+            .into(),
+            filter: Filter::Linear,
+            ..BlitImageInfo::images(image.clone(), image.clone())
+        })
         .expect("failed to blit a mip map to image!");
     }
 }
 
 impl ImmutableImage {
-    #[deprecated(note = "use ImmutableImage::uninitialized instead")]
-    #[inline]
-    pub fn new<'a, I>(
-        device: Arc<Device>,
-        dimensions: ImageDimensions,
-        format: Format,
-        queue_families: I,
-    ) -> Result<Arc<ImmutableImage>, ImageCreationError>
-    where
-        I: IntoIterator<Item = QueueFamily<'a>>,
-    {
-        #[allow(deprecated)]
-        ImmutableImage::with_mipmaps(
-            device,
-            dimensions,
-            format,
-            MipmapsCount::One,
-            queue_families,
-        )
-    }
-
-    #[deprecated(note = "use ImmutableImage::uninitialized instead")]
-    #[inline]
-    pub fn with_mipmaps<'a, I, M>(
-        device: Arc<Device>,
-        dimensions: ImageDimensions,
-        format: Format,
-        mipmaps: M,
-        queue_families: I,
-    ) -> Result<Arc<ImmutableImage>, ImageCreationError>
-    where
-        I: IntoIterator<Item = QueueFamily<'a>>,
-        M: Into<MipmapsCount>,
-    {
-        let usage = ImageUsage {
-            transfer_source: true, // for blits
-            transfer_destination: true,
-            sampled: true,
-            ..ImageUsage::none()
-        };
-
-        let flags = ImageCreateFlags::none();
-
-        let (image, _) = ImmutableImage::uninitialized(
-            device,
-            dimensions,
-            format,
-            mipmaps,
-            usage,
-            flags,
-            ImageLayout::ShaderReadOnlyOptimal,
-            queue_families,
-        )?;
-        image.initialized.store(true, Ordering::Relaxed); // Allow uninitialized access for backwards compatibility
-        Ok(image)
-    }
-
     /// Builds an uninitialized immutable image.
     ///
-    /// Returns two things: the image, and a special access that should be used for the initial upload to the image.
-    pub fn uninitialized<'a, I, M>(
-        device: Arc<Device>,
+    /// Returns two things: the image, and a special access that should be used for the initial
+    /// upload to the image.
+    pub fn uninitialized(
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: ImageDimensions,
         format: Format,
-        mipmaps: M,
+        mip_levels: impl Into<MipmapsCount>,
         usage: ImageUsage,
         flags: ImageCreateFlags,
         layout: ImageLayout,
-        queue_families: I,
-    ) -> Result<(Arc<ImmutableImage>, ImmutableImageInitialization), ImageCreationError>
-    where
-        I: IntoIterator<Item = QueueFamily<'a>>,
-        M: Into<MipmapsCount>,
+        queue_family_indices: impl IntoIterator<Item = u32>,
+    ) -> Result<(Arc<ImmutableImage>, Arc<ImmutableImageInitialization>), ImmutableImageCreationError>
     {
-        let queue_families = queue_families
-            .into_iter()
-            .map(|f| f.id())
-            .collect::<SmallVec<[u32; 4]>>();
+        let queue_family_indices: SmallVec<[_; 4]> = queue_family_indices.into_iter().collect();
+        assert!(!flags.intersects(ImageCreateFlags::DISJOINT)); // TODO: adjust the code below to make this safe
 
-        let (image, mem_reqs) = unsafe {
-            let sharing = if queue_families.len() >= 2 {
-                Sharing::Concurrent(queue_families.iter().cloned())
-            } else {
-                Sharing::Exclusive
-            };
-
-            UnsafeImage::new(
-                device.clone(),
-                usage,
-                format,
+        let raw_image = RawImage::new(
+            allocator.device().clone(),
+            ImageCreateInfo {
                 flags,
                 dimensions,
-                SampleCount::Sample1,
-                mipmaps,
-                sharing,
-                false,
-                false,
-            )?
-        };
-
-        let memory = MemoryPool::alloc_from_requirements(
-            &Device::standard_pool(&device),
-            &mem_reqs,
-            AllocLayout::Optimal,
-            MappingRequirement::DoNotMap,
-            DedicatedAlloc::Image(&image),
-            |t| {
-                if t.is_device_local() {
-                    AllocFromRequirementsFilter::Preferred
+                format: Some(format),
+                mip_levels: match mip_levels.into() {
+                    MipmapsCount::Specific(num) => num,
+                    MipmapsCount::Log2 => dimensions.max_mip_levels(),
+                    MipmapsCount::One => 1,
+                },
+                usage,
+                sharing: if queue_family_indices.len() >= 2 {
+                    Sharing::Concurrent(queue_family_indices)
                 } else {
-                    AllocFromRequirementsFilter::Allowed
-                }
+                    Sharing::Exclusive
+                },
+                ..Default::default()
             },
         )?;
-        debug_assert!((memory.offset() % mem_reqs.alignment) == 0);
-        unsafe {
-            image.bind_memory(memory.memory(), memory.offset())?;
-        }
-
-        let image = Arc::new(ImmutableImage {
-            image,
-            memory,
-            dimensions,
-            format,
-            initialized: AtomicBool::new(false),
-            layout,
-        });
-
-        let init = ImmutableImageInitialization {
-            image: image.clone(),
-            used: AtomicBool::new(false),
-            mip_levels_access: 0..image.mipmap_levels(),
-            layer_levels_access: 0..image.dimensions().array_layers(),
+        let requirements = raw_image.memory_requirements()[0];
+        let res = unsafe {
+            allocator.allocate_unchecked(
+                requirements,
+                AllocationType::NonLinear,
+                AllocationCreateInfo {
+                    usage: MemoryUsage::DeviceOnly,
+                    allocate_preference: MemoryAllocatePreference::Unknown,
+                    _ne: crate::NonExhaustive(()),
+                },
+                Some(DedicatedAllocation::Image(&raw_image)),
+            )
         };
 
-        Ok((image, init))
+        match res {
+            Ok(alloc) => {
+                debug_assert!(is_aligned(alloc.offset(), requirements.layout.alignment()));
+                debug_assert!(alloc.size() == requirements.layout.size());
+
+                let inner = Arc::new(
+                    unsafe { raw_image.bind_memory_unchecked([alloc]) }
+                        .map_err(|(err, _, _)| err)?,
+                );
+
+                let image = Arc::new(ImmutableImage { inner, layout });
+
+                let init = Arc::new(ImmutableImageInitialization {
+                    image: image.clone(),
+                });
+
+                Ok((image, init))
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Construct an ImmutableImage from the contents of `iter`.
-    #[inline]
-    pub fn from_iter<Px, I>(
+    ///
+    /// This is a convenience function, equivalent to creating a `CpuAccessibleBuffer`, writing
+    /// `iter` to it, then calling [`from_buffer`](ImmutableImage::from_buffer) to copy the data
+    /// over.
+    pub fn from_iter<Px, I, L, A>(
+        allocator: &(impl MemoryAllocator + ?Sized),
         iter: I,
         dimensions: ImageDimensions,
-        mipmaps: MipmapsCount,
+        mip_levels: MipmapsCount,
         format: Format,
-        queue: Arc<Queue>,
-    ) -> Result<
-        (
-            Arc<Self>,
-            CommandBufferExecFuture<NowFuture, PrimaryAutoCommandBuffer>,
-        ),
-        ImageCreationError,
-    >
+        command_buffer_builder: &mut AutoCommandBufferBuilder<L, A>,
+    ) -> Result<Arc<Self>, ImmutableImageCreationError>
     where
-        Px: Pixel + Send + Sync + Clone + 'static,
-        I: ExactSizeIterator<Item = Px>,
+        Px: BufferContents,
+        I: IntoIterator<Item = Px>,
+        I::IntoIter: ExactSizeIterator,
+        A: CommandBufferAllocator,
     {
-        let source = CpuAccessibleBuffer::from_iter(
-            queue.device().clone(),
-            BufferUsage::transfer_source(),
-            false,
+        let source = Buffer::from_iter(
+            allocator,
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                usage: MemoryUsage::Upload,
+                ..Default::default()
+            },
             iter,
-        )?;
-        ImmutableImage::from_buffer(source, dimensions, mipmaps, format, queue)
+        )
+        .map_err(|err| match err {
+            BufferError::AllocError(err) => err,
+            // We don't use sparse-binding, concurrent sharing or external memory, therefore the
+            // other errors can't happen.
+            _ => unreachable!(),
+        })?;
+
+        ImmutableImage::from_buffer(
+            allocator,
+            source,
+            dimensions,
+            mip_levels,
+            format,
+            command_buffer_builder,
+        )
     }
 
     /// Construct an ImmutableImage containing a copy of the data in `source`.
-    pub fn from_buffer<B, Px>(
-        source: B,
+    ///
+    /// This is a convenience function, equivalent to calling
+    /// [`uninitialized`](ImmutableImage::uninitialized) with the queue family index of
+    /// `command_buffer_builder`, then recording a `copy_buffer_to_image` command to
+    /// `command_buffer_builder`.
+    ///
+    /// `command_buffer_builder` can then be used to record other commands, built, and executed as
+    /// normal. If it is not executed, the image contents will be left undefined.
+    pub fn from_buffer<L, A>(
+        allocator: &(impl MemoryAllocator + ?Sized),
+        source: Subbuffer<impl ?Sized>,
         dimensions: ImageDimensions,
-        mipmaps: MipmapsCount,
+        mip_levels: MipmapsCount,
         format: Format,
-        queue: Arc<Queue>,
-    ) -> Result<
-        (
-            Arc<Self>,
-            CommandBufferExecFuture<NowFuture, PrimaryAutoCommandBuffer>,
-        ),
-        ImageCreationError,
-    >
+        command_buffer_builder: &mut AutoCommandBufferBuilder<L, A>,
+    ) -> Result<Arc<Self>, ImmutableImageCreationError>
     where
-        B: BufferAccess + TypedBufferAccess<Content = [Px]> + 'static + Clone + Send + Sync,
-        Px: Pixel + Send + Sync + Clone + 'static,
+        A: CommandBufferAllocator,
     {
-        let need_to_generate_mipmaps = has_mipmaps(mipmaps);
-        let usage = ImageUsage {
-            transfer_destination: true,
-            transfer_source: need_to_generate_mipmaps,
-            sampled: true,
-            ..ImageUsage::none()
+        let region = BufferImageCopy {
+            image_subresource: ImageSubresourceLayers::from_parameters(
+                format,
+                dimensions.array_layers(),
+            ),
+            image_extent: dimensions.width_height_depth(),
+            ..Default::default()
         };
-        let flags = ImageCreateFlags::none();
+        let required_size = region.buffer_copy_size(format);
+
+        if source.size() < required_size {
+            return Err(ImmutableImageCreationError::SourceTooSmall {
+                source_size: source.size(),
+                required_size,
+            });
+        }
+
+        let need_to_generate_mipmaps = has_mipmaps(mip_levels);
+        let usage = ImageUsage::TRANSFER_DST
+            | ImageUsage::SAMPLED
+            | if need_to_generate_mipmaps {
+                ImageUsage::TRANSFER_SRC
+            } else {
+                ImageUsage::empty()
+            };
+        let flags = ImageCreateFlags::empty();
         let layout = ImageLayout::ShaderReadOnlyOptimal;
 
         let (image, initializer) = ImmutableImage::uninitialized(
-            source.device().clone(),
+            allocator,
             dimensions,
             format,
-            mipmaps,
+            mip_levels,
             usage,
             flags,
             layout,
-            source.device().active_queue_families(),
+            source
+                .device()
+                .active_queue_family_indices()
+                .iter()
+                .copied(),
         )?;
 
-        let init = SubImage::new(
-            Arc::new(initializer),
-            0,
-            1,
-            0,
-            1,
-            ImageLayout::ShaderReadOnlyOptimal,
-        );
-
-        let mut cbb = AutoCommandBufferBuilder::primary(
-            source.device().clone(),
-            queue.family(),
-            CommandBufferUsage::MultipleSubmit,
-        )?;
-        cbb.copy_buffer_to_image_dimensions(
-            source,
-            init,
-            [0, 0, 0],
-            dimensions.width_height_depth(),
-            0,
-            dimensions.array_layers(),
-            0,
-        )
-        .unwrap();
+        command_buffer_builder
+            .copy_buffer_to_image(CopyBufferToImageInfo {
+                regions: smallvec![region],
+                ..CopyBufferToImageInfo::buffer_image(source, initializer)
+            })
+            .unwrap();
 
         if need_to_generate_mipmaps {
             generate_mipmaps(
-                &mut cbb,
+                command_buffer_builder,
                 image.clone(),
-                image.dimensions,
+                image.inner.dimensions(),
                 ImageLayout::ShaderReadOnlyOptimal,
             );
         }
 
-        let cb = cbb.build().unwrap();
-
-        let future = match cb.execute(queue) {
-            Ok(f) => f,
-            Err(e) => unreachable!("{:?}", e),
-        };
-
-        image.initialized.store(true, Ordering::Relaxed);
-
-        Ok((image, future))
+        Ok(image)
     }
 }
 
-impl<A> ImmutableImage<A> {
-    /// Returns the dimensions of the image.
+unsafe impl DeviceOwned for ImmutableImage {
     #[inline]
-    pub fn dimensions(&self) -> ImageDimensions {
-        self.dimensions
-    }
-
-    /// Returns the number of mipmap levels of the image.
-    #[inline]
-    pub fn mipmap_levels(&self) -> u32 {
-        self.image.mipmap_levels()
+    fn device(&self) -> &Arc<Device> {
+        self.inner.device()
     }
 }
 
-unsafe impl<A> ImageAccess for ImmutableImage<A> {
+unsafe impl ImageAccess for ImmutableImage {
     #[inline]
-    fn inner(&self) -> ImageInner {
+    fn inner(&self) -> ImageInner<'_> {
         ImageInner {
-            image: &self.image,
+            image: &self.inner,
             first_layer: 0,
-            num_layers: self.image.dimensions().array_layers() as usize,
+            num_layers: self.inner.dimensions().array_layers(),
             first_mipmap_level: 0,
-            num_mipmap_levels: self.image.mipmap_levels() as usize,
+            num_mipmap_levels: self.inner.mip_levels(),
         }
+    }
+
+    #[inline]
+    fn is_layout_initialized(&self) -> bool {
+        true
     }
 
     #[inline]
@@ -467,151 +341,51 @@ unsafe impl<A> ImageAccess for ImmutableImage<A> {
     #[inline]
     fn descriptor_layouts(&self) -> Option<ImageDescriptorLayouts> {
         Some(ImageDescriptorLayouts {
-            storage_image: self.layout,
+            storage_image: ImageLayout::General,
             combined_image_sampler: self.layout,
             sampled_image: self.layout,
             input_attachment: self.layout,
         })
     }
-
-    #[inline]
-    fn conflict_key(&self) -> u64 {
-        self.image.key()
-    }
-
-    #[inline]
-    fn try_gpu_lock(
-        &self,
-        exclusive_access: bool,
-        uninitialized_safe: bool,
-        expected_layout: ImageLayout,
-    ) -> Result<(), AccessError> {
-        if expected_layout != self.layout && expected_layout != ImageLayout::Undefined {
-            return Err(AccessError::UnexpectedImageLayout {
-                requested: expected_layout,
-                allowed: self.layout,
-            });
-        }
-
-        if exclusive_access {
-            return Err(AccessError::ExclusiveDenied);
-        }
-
-        if !self.initialized.load(Ordering::Relaxed) {
-            return Err(AccessError::BufferNotInitialized);
-        }
-
-        Ok(())
-    }
-
-    #[inline]
-    unsafe fn increase_gpu_lock(&self) {}
-
-    #[inline]
-    unsafe fn unlock(&self, new_layout: Option<ImageLayout>) {
-        debug_assert!(new_layout.is_none());
-    }
-
-    #[inline]
-    fn current_miplevels_access(&self) -> std::ops::Range<u32> {
-        0..self.mipmap_levels()
-    }
-
-    #[inline]
-    fn current_layer_levels_access(&self) -> std::ops::Range<u32> {
-        0..self.dimensions().array_layers()
-    }
 }
 
-unsafe impl<P, A> ImageContent<P> for ImmutableImage<A> {
-    #[inline]
+unsafe impl<P> ImageContent<P> for ImmutableImage {
     fn matches_format(&self) -> bool {
         true // FIXME:
     }
 }
 
-unsafe impl ImageAccess for SubImage {
-    #[inline]
-    fn inner(&self) -> ImageInner {
-        self.image.inner()
-    }
-
-    #[inline]
-    fn initial_layout_requirement(&self) -> ImageLayout {
-        self.image.initial_layout_requirement()
-    }
-
-    #[inline]
-    fn final_layout_requirement(&self) -> ImageLayout {
-        self.image.final_layout_requirement()
-    }
-
-    #[inline]
-    fn descriptor_layouts(&self) -> Option<ImageDescriptorLayouts> {
-        None
-    }
-
-    fn current_miplevels_access(&self) -> std::ops::Range<u32> {
-        self.mip_levels_access.clone()
-    }
-
-    fn current_layer_levels_access(&self) -> std::ops::Range<u32> {
-        self.layer_levels_access.clone()
-    }
-
-    #[inline]
-    fn conflict_key(&self) -> u64 {
-        self.image.conflict_key()
-    }
-
-    #[inline]
-    fn try_gpu_lock(
-        &self,
-        exclusive_access: bool,
-        uninitialized_safe: bool,
-        expected_layout: ImageLayout,
-    ) -> Result<(), AccessError> {
-        if expected_layout != self.layout && expected_layout != ImageLayout::Undefined {
-            return Err(AccessError::UnexpectedImageLayout {
-                requested: expected_layout,
-                allowed: self.layout,
-            });
-        }
-
-        Ok(())
-    }
-
-    #[inline]
-    unsafe fn increase_gpu_lock(&self) {
-        self.image.increase_gpu_lock()
-    }
-
-    #[inline]
-    unsafe fn unlock(&self, new_layout: Option<ImageLayout>) {
-        self.image.unlock(new_layout)
-    }
-}
-
-impl<A> PartialEq for ImmutableImage<A> {
+impl PartialEq for ImmutableImage {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        ImageAccess::inner(self) == ImageAccess::inner(other)
+        self.inner() == other.inner()
     }
 }
 
-impl<A> Eq for ImmutableImage<A> {}
+impl Eq for ImmutableImage {}
 
-impl<A> Hash for ImmutableImage<A> {
-    #[inline]
+impl Hash for ImmutableImage {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        ImageAccess::inner(self).hash(state);
+        self.inner().hash(state);
     }
 }
 
-unsafe impl<A> ImageAccess for ImmutableImageInitialization<A> {
+// Must not implement Clone, as that would lead to multiple `used` values.
+pub struct ImmutableImageInitialization {
+    image: Arc<ImmutableImage>,
+}
+
+unsafe impl DeviceOwned for ImmutableImageInitialization {
     #[inline]
-    fn inner(&self) -> ImageInner {
-        ImageAccess::inner(&self.image)
+    fn device(&self) -> &Arc<Device> {
+        self.image.device()
+    }
+}
+
+unsafe impl ImageAccess for ImmutableImageInitialization {
+    #[inline]
+    fn inner(&self) -> ImageInner<'_> {
+        self.image.inner()
     }
 
     #[inline]
@@ -628,76 +402,88 @@ unsafe impl<A> ImageAccess for ImmutableImageInitialization<A> {
     fn descriptor_layouts(&self) -> Option<ImageDescriptorLayouts> {
         None
     }
-
-    #[inline]
-    fn conflict_key(&self) -> u64 {
-        self.image.image.key()
-    }
-
-    #[inline]
-    fn try_gpu_lock(
-        &self,
-        _: bool,
-        uninitialized_safe: bool,
-        expected_layout: ImageLayout,
-    ) -> Result<(), AccessError> {
-        if expected_layout != ImageLayout::Undefined {
-            return Err(AccessError::UnexpectedImageLayout {
-                requested: expected_layout,
-                allowed: ImageLayout::Undefined,
-            });
-        }
-
-        if self.image.initialized.load(Ordering::Relaxed) {
-            return Err(AccessError::AlreadyInUse);
-        }
-
-        // FIXME: Mipmapped textures require multiple writes to initialize
-        if !self
-            .used
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .unwrap_or_else(|e| e)
-        {
-            Ok(())
-        } else {
-            Err(AccessError::AlreadyInUse)
-        }
-    }
-
-    #[inline]
-    unsafe fn increase_gpu_lock(&self) {
-        debug_assert!(self.used.load(Ordering::Relaxed));
-    }
-
-    #[inline]
-    unsafe fn unlock(&self, new_layout: Option<ImageLayout>) {
-        assert_eq!(new_layout, Some(self.image.layout));
-        self.image.initialized.store(true, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn current_miplevels_access(&self) -> std::ops::Range<u32> {
-        self.mip_levels_access.clone()
-    }
-
-    #[inline]
-    fn current_layer_levels_access(&self) -> std::ops::Range<u32> {
-        self.layer_levels_access.clone()
-    }
 }
 
-impl<A> PartialEq for ImmutableImageInitialization<A> {
+impl PartialEq for ImmutableImageInitialization {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        ImageAccess::inner(self) == ImageAccess::inner(other)
+        self.inner() == other.inner()
     }
 }
 
-impl<A> Eq for ImmutableImageInitialization<A> {}
+impl Eq for ImmutableImageInitialization {}
 
-impl<A> Hash for ImmutableImageInitialization<A> {
-    #[inline]
+impl Hash for ImmutableImageInitialization {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        ImageAccess::inner(self).hash(state);
+        self.inner().hash(state);
+    }
+}
+
+/// Error that can happen when creating an `ImmutableImage`.
+#[derive(Clone, Debug)]
+pub enum ImmutableImageCreationError {
+    ImageCreationError(ImageError),
+    AllocError(AllocationCreationError),
+    CommandBufferBeginError(CommandBufferBeginError),
+
+    /// The size of the provided source data is less than the required size for an image with the
+    /// given format and dimensions.
+    SourceTooSmall {
+        source_size: DeviceSize,
+        required_size: DeviceSize,
+    },
+}
+
+impl Error for ImmutableImageCreationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ImageCreationError(err) => Some(err),
+            Self::AllocError(err) => Some(err),
+            Self::CommandBufferBeginError(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl Display for ImmutableImageCreationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
+        match self {
+            Self::ImageCreationError(err) => err.fmt(f),
+            Self::AllocError(err) => err.fmt(f),
+            Self::CommandBufferBeginError(err) => err.fmt(f),
+            Self::SourceTooSmall {
+                source_size,
+                required_size,
+            } => write!(
+                f,
+                "the size of the provided source data ({} bytes) is less than the required size \
+                for an image of the given format and dimensions ({} bytes)",
+                source_size, required_size,
+            ),
+        }
+    }
+}
+
+impl From<ImageError> for ImmutableImageCreationError {
+    fn from(err: ImageError) -> Self {
+        Self::ImageCreationError(err)
+    }
+}
+
+impl From<AllocationCreationError> for ImmutableImageCreationError {
+    fn from(err: AllocationCreationError) -> Self {
+        Self::AllocError(err)
+    }
+}
+
+impl From<VulkanError> for ImmutableImageCreationError {
+    fn from(err: VulkanError) -> Self {
+        Self::AllocError(err.into())
+    }
+}
+
+impl From<CommandBufferBeginError> for ImmutableImageCreationError {
+    fn from(err: CommandBufferBeginError) -> Self {
+        Self::CommandBufferBeginError(err)
     }
 }
