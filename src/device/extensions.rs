@@ -7,148 +7,10 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use crate::device::physical::PhysicalDevice;
-pub use crate::extensions::{
-    ExtensionRestriction, ExtensionRestrictionError, SupportedExtensionsError,
-};
+pub use crate::extensions::{ExtensionRestriction, ExtensionRestrictionError};
 
-macro_rules! device_extensions {
-    (
-        $($member:ident => {
-            doc: $doc:expr,
-            raw: $raw:expr,
-            requires_core: $requires_core:expr,
-            requires_device_extensions: [$($requires_device_extension:ident),*],
-            requires_instance_extensions: [$($requires_instance_extension:ident),*],
-            required_if_supported: $required_if_supported:expr,
-            conflicts_device_extensions: [$($conflicts_device_extension:ident),*],
-        },)*
-    ) => (
-        extensions! {
-            DeviceExtensions,
-            $( $member => {
-                doc: $doc,
-                raw: $raw,
-                requires_core: $requires_core,
-                requires_device_extensions: [$($requires_device_extension),*],
-                requires_instance_extensions: [$($requires_instance_extension),*],
-            },)*
-        }
-
-        impl DeviceExtensions {
-            /// Checks enabled extensions against the device version, instance extensions and each other.
-            pub(super) fn check_requirements(
-                &self,
-                supported: &DeviceExtensions,
-                api_version: crate::Version,
-                instance_extensions: &InstanceExtensions,
-            ) -> Result<(), crate::extensions::ExtensionRestrictionError> {
-                $(
-                    if self.$member {
-                        if !supported.$member {
-                            return Err(crate::extensions::ExtensionRestrictionError {
-                                extension: stringify!($member),
-                                restriction: crate::extensions::ExtensionRestriction::NotSupported,
-                            });
-                        }
-
-                        if api_version < $requires_core {
-                            return Err(crate::extensions::ExtensionRestrictionError {
-                                extension: stringify!($member),
-                                restriction: crate::extensions::ExtensionRestriction::RequiresCore($requires_core),
-                            });
-                        }
-
-                        $(
-                            if !self.$requires_device_extension {
-                                return Err(crate::extensions::ExtensionRestrictionError {
-                                    extension: stringify!($member),
-                                    restriction: crate::extensions::ExtensionRestriction::RequiresDeviceExtension(stringify!($requires_device_extension)),
-                                });
-                            }
-                        )*
-
-                        $(
-                            if !instance_extensions.$requires_instance_extension {
-                                return Err(crate::extensions::ExtensionRestrictionError {
-                                    extension: stringify!($member),
-                                    restriction: crate::extensions::ExtensionRestriction::RequiresInstanceExtension(stringify!($requires_instance_extension)),
-                                });
-                            }
-                        )*
-
-                        $(
-                            if self.$conflicts_device_extension {
-                                return Err(crate::extensions::ExtensionRestrictionError {
-                                    extension: stringify!($member),
-                                    restriction: crate::extensions::ExtensionRestriction::ConflictsDeviceExtension(stringify!($conflicts_device_extension)),
-                                });
-                            }
-                        )*
-                    } else {
-                        if $required_if_supported && supported.$member {
-                            return Err(crate::extensions::ExtensionRestrictionError {
-                                extension: stringify!($member),
-                                restriction: crate::extensions::ExtensionRestriction::RequiredIfSupported,
-                            });
-                        }
-                    }
-                )*
-                Ok(())
-            }
-
-            pub(crate) fn required_if_supported_extensions() -> Self {
-                Self {
-                    $(
-                        $member: $required_if_supported,
-                    )*
-                    _unbuildable: crate::extensions::Unbuildable(())
-                }
-            }
-        }
-   );
-}
-
-pub use crate::autogen::DeviceExtensions;
-pub(crate) use device_extensions;
-
-impl DeviceExtensions {
-    /// See the docs of supported_by_device().
-    #[deprecated(
-        since = "0.25",
-        note = "Use PhysicalDevice::supported_extensions instead"
-    )]
-    pub fn supported_by_device_raw(
-        physical_device: PhysicalDevice,
-    ) -> Result<Self, SupportedExtensionsError> {
-        Ok(*physical_device.supported_extensions())
-    }
-
-    /// Returns a `DeviceExtensions` object with extensions supported by the `PhysicalDevice`.
-    #[deprecated(
-        since = "0.25",
-        note = "Use PhysicalDevice::supported_extensions instead"
-    )]
-    pub fn supported_by_device(physical_device: PhysicalDevice) -> Self {
-        *physical_device.supported_extensions()
-    }
-
-    /// Returns a `DeviceExtensions` object with extensions required as well as supported by the `PhysicalDevice`.
-    /// They are needed to be passed to `Device::new(...)`.
-    #[deprecated(
-        since = "0.25",
-        note = "Use PhysicalDevice::required_extensions instead"
-    )]
-    pub fn required_extensions(physical_device: PhysicalDevice) -> Self {
-        *physical_device.required_extensions()
-    }
-}
-
-/// This helper type can only be instantiated inside this module.
-/// See `*Extensions::_unbuildable`.
-#[doc(hidden)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Unbuildable(());
+// Generated by build.rs
+include!(concat!(env!("OUT_DIR"), "/device_extensions.rs"));
 
 #[cfg(test)]
 mod tests {
@@ -157,18 +19,22 @@ mod tests {
 
     #[test]
     fn empty_extensions() {
-        let d: Vec<CString> = (&DeviceExtensions::none()).into();
-        assert!(d.iter().next().is_none());
+        let d: Vec<CString> = (&DeviceExtensions::empty()).into();
+        assert!(d.get(0).is_none());
     }
 
     #[test]
-    fn required_if_supported_extensions() {
-        assert_eq!(
-            DeviceExtensions::required_if_supported_extensions(),
-            DeviceExtensions {
-                khr_portability_subset: true,
-                ..DeviceExtensions::none()
+    fn into_iter() {
+        let extensions = DeviceExtensions {
+            khr_swapchain: true,
+            ..DeviceExtensions::empty()
+        };
+        for (name, enabled) in extensions {
+            if name == "VK_KHR_swapchain" {
+                assert!(enabled);
+            } else {
+                assert!(!enabled);
             }
-        )
+        }
     }
 }
