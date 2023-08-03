@@ -7,25 +7,20 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use std::sync::Arc;
-
-use crate::buffer::BufferAccess;
-use crate::command_buffer::submit::SubmitAnyBuilder;
-use crate::device::Device;
-use crate::device::DeviceOwned;
-use crate::device::Queue;
-use crate::image::ImageAccess;
-use crate::image::ImageLayout;
-use crate::sync::AccessCheckError;
-use crate::sync::AccessFlags;
-use crate::sync::FlushError;
-use crate::sync::GpuFuture;
-use crate::sync::PipelineStages;
+use super::{AccessCheckError, FlushError, GpuFuture, SubmitAnyBuilder};
+use crate::{
+    buffer::Buffer,
+    device::{Device, DeviceOwned, Queue},
+    image::{sys::Image, ImageLayout},
+    swapchain::Swapchain,
+    DeviceSize,
+};
+use std::{ops::Range, sync::Arc};
 
 /// Builds a future that represents "now".
 #[inline]
 pub fn now(device: Arc<Device>) -> NowFuture {
-    NowFuture { device: device }
+    NowFuture { device }
 }
 
 /// A dummy future that represents "now".
@@ -63,21 +58,33 @@ unsafe impl GpuFuture for NowFuture {
     #[inline]
     fn check_buffer_access(
         &self,
-        buffer: &dyn BufferAccess,
-        _: bool,
-        _: &Queue,
-    ) -> Result<Option<(PipelineStages, AccessFlags)>, AccessCheckError> {
+        _buffer: &Buffer,
+        _range: Range<DeviceSize>,
+        _exclusive: bool,
+        _queue: &Queue,
+    ) -> Result<(), AccessCheckError> {
         Err(AccessCheckError::Unknown)
     }
 
     #[inline]
     fn check_image_access(
         &self,
-        _: &dyn ImageAccess,
-        _: ImageLayout,
-        _: bool,
-        _: &Queue,
-    ) -> Result<Option<(PipelineStages, AccessFlags)>, AccessCheckError> {
+        _image: &Image,
+        _range: Range<DeviceSize>,
+        _exclusive: bool,
+        _expected_layout: ImageLayout,
+        _queue: &Queue,
+    ) -> Result<(), AccessCheckError> {
+        Err(AccessCheckError::Unknown)
+    }
+
+    #[inline]
+    fn check_swapchain_image_acquired(
+        &self,
+        _swapchain: &Swapchain,
+        _image_index: u32,
+        _before: bool,
+    ) -> Result<(), AccessCheckError> {
         Err(AccessCheckError::Unknown)
     }
 }

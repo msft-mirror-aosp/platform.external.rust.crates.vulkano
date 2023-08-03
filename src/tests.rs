@@ -12,16 +12,15 @@
 /// Creates an instance or returns if initialization fails.
 macro_rules! instance {
     () => {{
-        use crate::instance;
-        use crate::Version;
+        use crate::{instance::Instance, VulkanLibrary};
 
-        match instance::Instance::new(
-            None,
-            Version::V1_1,
-            &instance::InstanceExtensions::none(),
-            None,
-        ) {
-            Ok(i) => i,
+        let library = match VulkanLibrary::new() {
+            Ok(x) => x,
+            Err(_) => return,
+        };
+
+        match Instance::new(library, Default::default()) {
+            Ok(x) => x,
             Err(_) => return,
         }
     }};
@@ -30,42 +29,61 @@ macro_rules! instance {
 /// Creates a device and a queue for graphics operations.
 macro_rules! gfx_dev_and_queue {
     ($($feature:ident),*) => ({
-        use crate::device::physical::PhysicalDevice;
-        use crate::device::Device;
-        use crate::device::DeviceExtensions;
+        use crate::device::physical::PhysicalDeviceType;
+        use crate::device::{Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo};
         use crate::device::Features;
 
         let instance = instance!();
-
-        let physical = match PhysicalDevice::enumerate(&instance).next() {
-            Some(p) => p,
-            None => return
-        };
-
-        let queue = match physical.queue_families().find(|q| q.supports_graphics()) {
-            Some(q) => q,
-            None => return
-        };
-
-        let extensions = DeviceExtensions::none();
-
-        let features = Features {
+        let enabled_extensions = DeviceExtensions::empty();
+        let enabled_features = Features {
             $(
                 $feature: true,
             )*
-            .. Features::none()
+            .. Features::empty()
         };
 
-        // If the physical device doesn't support the requested features, just return.
-        if !physical.supported_features().is_superset_of(&features) {
-            return;
+        let select = match instance.enumerate_physical_devices() {
+            Ok(x) => x,
+            Err(_) => return,
         }
+            .filter(|p| {
+                p.supported_extensions().contains(&enabled_extensions) &&
+                p.supported_features().contains(&enabled_features)
+            })
+            .filter_map(|p| {
+                p.queue_family_properties().iter()
+                    .position(|q| q.queue_flags.intersects(crate::device::QueueFlags::GRAPHICS))
+                    .map(|i| (p, i as u32))
+            })
+            .min_by_key(|(p, _)| {
+                match p.properties().device_type {
+                    PhysicalDeviceType::DiscreteGpu => 0,
+                    PhysicalDeviceType::IntegratedGpu => 1,
+                    PhysicalDeviceType::VirtualGpu => 2,
+                    PhysicalDeviceType::Cpu => 3,
+                    PhysicalDeviceType::Other => 4,
+                }
+            });
 
-        let (device, mut queues) = match Device::new(physical, &features,
-                                                     &extensions, [(queue, 0.5)].iter().cloned())
-        {
+        let (physical_device, queue_family_index) = match select {
+            Some(x) => x,
+            None => return,
+        };
+
+        let (device, mut queues) = match Device::new(
+            physical_device,
+            DeviceCreateInfo {
+                queue_create_infos: vec![QueueCreateInfo {
+                    queue_family_index,
+                    ..Default::default()
+                }],
+                enabled_extensions,
+                enabled_features,
+                ..Default::default()
+            }
+        ) {
             Ok(r) => r,
-            Err(_) => return
+            Err(_) => return,
         };
 
         (device, queues.next().unwrap())
