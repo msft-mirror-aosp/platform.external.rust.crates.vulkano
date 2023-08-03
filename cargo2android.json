@@ -7,5 +7,6 @@
   "device": true,
   "no-presubmit": true,
   "run": true,
-  "tests": true
+  "tests": false,
+  "features": ""
 }
