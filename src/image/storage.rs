@@ -7,190 +7,472 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use crate::device::physical::QueueFamily;
-use crate::device::Device;
-use crate::format::ClearValue;
-use crate::format::Format;
-use crate::format::FormatTy;
-use crate::image::sys::ImageCreationError;
-use crate::image::sys::UnsafeImage;
-use crate::image::traits::ImageAccess;
-use crate::image::traits::ImageClearValue;
-use crate::image::traits::ImageContent;
-use crate::image::ImageCreateFlags;
-use crate::image::ImageDescriptorLayouts;
-use crate::image::ImageDimensions;
-use crate::image::ImageInner;
-use crate::image::ImageLayout;
-use crate::image::ImageUsage;
-use crate::image::SampleCount;
-use crate::memory::pool::AllocFromRequirementsFilter;
-use crate::memory::pool::AllocLayout;
-use crate::memory::pool::MappingRequirement;
-use crate::memory::pool::MemoryPool;
-use crate::memory::pool::MemoryPoolAlloc;
-use crate::memory::pool::PotentialDedicatedAllocation;
-use crate::memory::pool::StdMemoryPool;
-use crate::memory::DedicatedAlloc;
-use crate::sync::AccessError;
-use crate::sync::Sharing;
+use super::{
+    sys::{Image, ImageMemory, RawImage},
+    traits::ImageContent,
+    ImageAccess, ImageAspects, ImageCreateFlags, ImageDescriptorLayouts, ImageDimensions,
+    ImageError, ImageInner, ImageLayout, ImageUsage,
+};
+use crate::{
+    device::{Device, DeviceOwned, Queue},
+    format::Format,
+    image::{sys::ImageCreateInfo, view::ImageView, ImageFormatInfo},
+    memory::{
+        allocator::{
+            AllocationCreateInfo, AllocationType, MemoryAllocatePreference, MemoryAllocator,
+            MemoryUsage,
+        },
+        is_aligned, DedicatedAllocation, DeviceMemoryError, ExternalMemoryHandleType,
+        ExternalMemoryHandleTypes,
+    },
+    sync::Sharing,
+    DeviceSize,
+};
 use smallvec::SmallVec;
-use std::hash::Hash;
-use std::hash::Hasher;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+
+#[cfg(target_os = "linux")]
+use crate::{
+    image::ImageTiling,
+    memory::{allocator::MemoryAlloc, DeviceMemory, MemoryAllocateFlags, MemoryAllocateInfo},
+};
+#[cfg(target_os = "linux")]
+use ash::vk::{ImageDrmFormatModifierExplicitCreateInfoEXT, SubresourceLayout};
+#[cfg(target_os = "linux")]
+use std::os::unix::prelude::{FromRawFd, IntoRawFd, RawFd};
+
+use std::{
+    fs::File,
+    hash::{Hash, Hasher},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 /// General-purpose image in device memory. Can be used for any usage, but will be slower than a
 /// specialized image.
 #[derive(Debug)]
-pub struct StorageImage<A = Arc<StdMemoryPool>>
-where
-    A: MemoryPool,
-{
-    // Inner implementation.
-    image: UnsafeImage,
+pub struct StorageImage {
+    inner: Arc<Image>,
 
-    // Memory used to back the image.
-    memory: PotentialDedicatedAllocation<A::Alloc>,
-
-    // Dimensions of the image.
-    dimensions: ImageDimensions,
-
-    // Format.
-    format: Format,
-
-    // Queue families allowed to access this image.
-    queue_families: SmallVec<[u32; 4]>,
-
-    // Number of times this image is locked on the GPU side.
-    gpu_lock: AtomicUsize,
+    // If true, then the image is in the layout `General`. If false, then it
+    // is still `Undefined`.
+    layout_initialized: AtomicBool,
 }
 
 impl StorageImage {
     /// Creates a new image with the given dimensions and format.
-    #[inline]
-    pub fn new<'a, I>(
-        device: Arc<Device>,
+    pub fn new(
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: ImageDimensions,
         format: Format,
-        queue_families: I,
-    ) -> Result<Arc<StorageImage>, ImageCreationError>
-    where
-        I: IntoIterator<Item = QueueFamily<'a>>,
-    {
-        let is_depth = match format.ty() {
-            FormatTy::Depth => true,
-            FormatTy::DepthStencil => true,
-            FormatTy::Stencil => true,
-            FormatTy::Compressed => panic!(),
-            _ => false,
-        };
+        queue_family_indices: impl IntoIterator<Item = u32>,
+    ) -> Result<Arc<StorageImage>, ImageError> {
+        let aspects = format.aspects();
+        let is_depth_stencil = aspects.intersects(ImageAspects::DEPTH | ImageAspects::STENCIL);
 
-        let usage = ImageUsage {
-            transfer_source: true,
-            transfer_destination: true,
-            sampled: true,
-            storage: true,
-            color_attachment: !is_depth,
-            depth_stencil_attachment: is_depth,
-            input_attachment: true,
-            transient_attachment: false,
-        };
-        let flags = ImageCreateFlags::none();
+        if format.compression().is_some() {
+            panic!() // TODO: message?
+        }
 
-        StorageImage::with_usage(device, dimensions, format, usage, flags, queue_families)
+        let usage = ImageUsage::TRANSFER_SRC
+            | ImageUsage::TRANSFER_DST
+            | ImageUsage::SAMPLED
+            | ImageUsage::STORAGE
+            | ImageUsage::INPUT_ATTACHMENT
+            | if is_depth_stencil {
+                ImageUsage::DEPTH_STENCIL_ATTACHMENT
+            } else {
+                ImageUsage::COLOR_ATTACHMENT
+            };
+        let flags = ImageCreateFlags::empty();
+
+        StorageImage::with_usage(
+            allocator,
+            dimensions,
+            format,
+            usage,
+            flags,
+            queue_family_indices,
+        )
     }
 
     /// Same as `new`, but allows specifying the usage.
-    pub fn with_usage<'a, I>(
+    pub fn with_usage(
+        allocator: &(impl MemoryAllocator + ?Sized),
+        dimensions: ImageDimensions,
+        format: Format,
+        usage: ImageUsage,
+        flags: ImageCreateFlags,
+        queue_family_indices: impl IntoIterator<Item = u32>,
+    ) -> Result<Arc<StorageImage>, ImageError> {
+        let queue_family_indices: SmallVec<[_; 4]> = queue_family_indices.into_iter().collect();
+        assert!(!flags.intersects(ImageCreateFlags::DISJOINT)); // TODO: adjust the code below to make this safe
+
+        let raw_image = RawImage::new(
+            allocator.device().clone(),
+            ImageCreateInfo {
+                flags,
+                dimensions,
+                format: Some(format),
+                usage,
+                sharing: if queue_family_indices.len() >= 2 {
+                    Sharing::Concurrent(queue_family_indices)
+                } else {
+                    Sharing::Exclusive
+                },
+                ..Default::default()
+            },
+        )?;
+        let requirements = raw_image.memory_requirements()[0];
+        let res = unsafe {
+            allocator.allocate_unchecked(
+                requirements,
+                AllocationType::NonLinear,
+                AllocationCreateInfo {
+                    usage: MemoryUsage::DeviceOnly,
+                    allocate_preference: MemoryAllocatePreference::Unknown,
+                    _ne: crate::NonExhaustive(()),
+                },
+                Some(DedicatedAllocation::Image(&raw_image)),
+            )
+        };
+
+        match res {
+            Ok(alloc) => {
+                debug_assert!(is_aligned(alloc.offset(), requirements.layout.alignment()));
+                debug_assert!(alloc.size() == requirements.layout.size());
+
+                let inner = Arc::new(
+                    unsafe { raw_image.bind_memory_unchecked([alloc]) }
+                        .map_err(|(err, _, _)| err)?,
+                );
+
+                Ok(Arc::new(StorageImage {
+                    inner,
+                    layout_initialized: AtomicBool::new(false),
+                }))
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub fn new_with_exportable_fd(
+        allocator: &(impl MemoryAllocator + ?Sized),
+        dimensions: ImageDimensions,
+        format: Format,
+        usage: ImageUsage,
+        flags: ImageCreateFlags,
+        queue_family_indices: impl IntoIterator<Item = u32>,
+    ) -> Result<Arc<StorageImage>, ImageError> {
+        let queue_family_indices: SmallVec<[_; 4]> = queue_family_indices.into_iter().collect();
+        assert!(!flags.intersects(ImageCreateFlags::DISJOINT)); // TODO: adjust the code below to make this safe
+
+        let external_memory_properties = allocator
+            .device()
+            .physical_device()
+            .image_format_properties(ImageFormatInfo {
+                flags,
+                format: Some(format),
+                image_type: dimensions.image_type(),
+                usage,
+                external_memory_handle_type: Some(ExternalMemoryHandleType::OpaqueFd),
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap()
+            .external_memory_properties;
+        // VUID-VkExportMemoryAllocateInfo-handleTypes-00656
+        assert!(external_memory_properties.exportable);
+
+        // VUID-VkMemoryAllocateInfo-pNext-00639
+        // Guaranteed because we always create a dedicated allocation
+
+        let external_memory_handle_types = ExternalMemoryHandleTypes::OPAQUE_FD;
+        let raw_image = RawImage::new(
+            allocator.device().clone(),
+            ImageCreateInfo {
+                flags,
+                dimensions,
+                format: Some(format),
+                usage,
+                sharing: if queue_family_indices.len() >= 2 {
+                    Sharing::Concurrent(queue_family_indices)
+                } else {
+                    Sharing::Exclusive
+                },
+                external_memory_handle_types,
+                ..Default::default()
+            },
+        )?;
+        let requirements = raw_image.memory_requirements()[0];
+        let memory_type_index = allocator
+            .find_memory_type_index(
+                requirements.memory_type_bits,
+                MemoryUsage::DeviceOnly.into(),
+            )
+            .expect("failed to find a suitable memory type");
+
+        match unsafe {
+            allocator.allocate_dedicated_unchecked(
+                memory_type_index,
+                requirements.layout.size(),
+                Some(DedicatedAllocation::Image(&raw_image)),
+                external_memory_handle_types,
+            )
+        } {
+            Ok(alloc) => {
+                debug_assert!(is_aligned(alloc.offset(), requirements.layout.alignment()));
+                debug_assert!(alloc.size() == requirements.layout.size());
+
+                let inner = Arc::new(unsafe {
+                    raw_image
+                        .bind_memory_unchecked([alloc])
+                        .map_err(|(err, _, _)| err)?
+                });
+
+                Ok(Arc::new(StorageImage {
+                    inner,
+                    layout_initialized: AtomicBool::new(false),
+                }))
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Creates a new image from a set of Linux dma_buf file descriptors. The memory will be imported from the file desciptors, and will be bound to the image.
+    /// # Arguments
+    /// * `fds` - The list of file descriptors to import from. Single planar images should only use one, and multiplanar images can use multiple, for example, for each color.
+    /// * `offset` - The byte offset from the start of the image of the plane where the image subresource begins.
+    /// * `pitch` - Describes the number of bytes between each row of texels in an image.
+    pub fn new_from_dma_buf_fd(
+        allocator: &(impl MemoryAllocator + ?Sized),
         device: Arc<Device>,
         dimensions: ImageDimensions,
         format: Format,
         usage: ImageUsage,
         flags: ImageCreateFlags,
-        queue_families: I,
-    ) -> Result<Arc<StorageImage>, ImageCreationError>
-    where
-        I: IntoIterator<Item = QueueFamily<'a>>,
-    {
-        let queue_families = queue_families
-            .into_iter()
-            .map(|f| f.id())
-            .collect::<SmallVec<[u32; 4]>>();
+        queue_family_indices: impl IntoIterator<Item = u32>,
+        mut subresource_data: Vec<SubresourceData>,
+        drm_format_modifier: u64,
+    ) -> Result<Arc<StorageImage>, ImageError> {
+        let queue_family_indices: SmallVec<[_; 4]> = queue_family_indices.into_iter().collect();
 
-        let (image, mem_reqs) = unsafe {
-            let sharing = if queue_families.len() >= 2 {
-                Sharing::Concurrent(queue_families.iter().cloned())
-            } else {
-                Sharing::Exclusive
-            };
-
-            UnsafeImage::new(
-                device.clone(),
-                usage,
-                format,
-                flags,
-                dimensions,
-                SampleCount::Sample1,
-                1,
-                sharing,
-                false,
-                false,
-            )?
-        };
-
-        let memory = MemoryPool::alloc_from_requirements(
-            &Device::standard_pool(&device),
-            &mem_reqs,
-            AllocLayout::Optimal,
-            MappingRequirement::DoNotMap,
-            DedicatedAlloc::Image(&image),
-            |t| {
-                if t.is_device_local() {
-                    AllocFromRequirementsFilter::Preferred
-                } else {
-                    AllocFromRequirementsFilter::Allowed
-                }
-            },
-        )?;
-        debug_assert!((memory.offset() % mem_reqs.alignment) == 0);
-        unsafe {
-            image.bind_memory(memory.memory(), memory.offset())?;
+        // TODO: Support multiplanar image importing from Linux FD
+        if subresource_data.len() > 1 {
+            todo!();
         }
 
+        // Create a vector of the layout of each image plane.
+
+        // All of the following are automatically true, since the values are explicitly set as such:
+        // VUID-VkImageDrmFormatModifierExplicitCreateInfoEXT-size-02267
+        // VUID-VkImageDrmFormatModifierExplicitCreateInfoEXT-arrayPitch-02268
+        // VUID-VkImageDrmFormatModifierExplicitCreateInfoEXT-depthPitch-02269
+        let layout: Vec<SubresourceLayout> = subresource_data
+            .iter_mut()
+            .map(
+                |SubresourceData {
+                     fd: _,
+                     offset,
+                     row_pitch,
+                 }| {
+                    SubresourceLayout {
+                        offset: *offset,
+                        size: 0,
+                        row_pitch: *row_pitch,
+                        array_pitch: 0_u64,
+                        depth_pitch: 0_u64,
+                    }
+                },
+            )
+            .collect();
+
+        let fds: Vec<RawFd> = subresource_data
+            .iter_mut()
+            .map(
+                |SubresourceData {
+                     fd,
+                     offset: _,
+                     row_pitch: _,
+                 }| { *fd },
+            )
+            .collect();
+
+        let drm_mod = ImageDrmFormatModifierExplicitCreateInfoEXT::builder()
+            .drm_format_modifier(drm_format_modifier)
+            .plane_layouts(layout.as_ref())
+            .build();
+
+        let external_memory_handle_types = ExternalMemoryHandleTypes::DMA_BUF;
+
+        let image = RawImage::new(
+            device.clone(),
+            ImageCreateInfo {
+                flags,
+                dimensions,
+                format: Some(format),
+                usage,
+                sharing: if queue_family_indices.len() >= 2 {
+                    Sharing::Concurrent(queue_family_indices)
+                } else {
+                    Sharing::Exclusive
+                },
+                external_memory_handle_types,
+                tiling: ImageTiling::DrmFormatModifier,
+                image_drm_format_modifier_create_info: Some(drm_mod),
+                ..Default::default()
+            },
+        )?;
+
+        let requirements = image.memory_requirements()[0];
+        let memory_type_index = allocator
+            .find_memory_type_index(
+                requirements.memory_type_bits,
+                MemoryUsage::DeviceOnly.into(),
+            )
+            .expect("failed to find a suitable memory type");
+
+        assert!(device.enabled_extensions().khr_external_memory_fd);
+        assert!(device.enabled_extensions().khr_external_memory);
+        assert!(device.enabled_extensions().ext_external_memory_dma_buf);
+
+        let memory = unsafe {
+            // TODO: For completeness, importing memory from muliple file descriptors should be added (In order to support importing multiplanar images). As of now, only single planar image importing will work.
+            if fds.len() != 1 {
+                todo!();
+            }
+
+            // Try cloning underlying fd
+            let file = File::from_raw_fd(*fds.first().expect("file descriptor Vec is empty"));
+            let new_file = file.try_clone().expect("error cloning file descriptor");
+
+            // Turn the original file descriptor back into a raw fd to avoid ownership problems
+            file.into_raw_fd();
+            DeviceMemory::import(
+                device,
+                MemoryAllocateInfo {
+                    allocation_size: requirements.layout.size(),
+                    memory_type_index,
+                    dedicated_allocation: Some(DedicatedAllocation::Image(&image)),
+                    export_handle_types: ExternalMemoryHandleTypes::empty(),
+                    flags: MemoryAllocateFlags::empty(),
+                    ..Default::default()
+                },
+                crate::memory::MemoryImportInfo::Fd {
+                    handle_type: crate::memory::ExternalMemoryHandleType::DmaBuf,
+                    file: new_file,
+                },
+            )
+            .unwrap() // TODO: Handle
+        };
+
+        let mem_alloc = MemoryAlloc::new(memory).unwrap();
+
+        debug_assert!(mem_alloc.offset() % requirements.layout.alignment().as_nonzero() == 0);
+        debug_assert!(mem_alloc.size() == requirements.layout.size());
+
+        let inner = Arc::new(unsafe {
+            image
+                .bind_memory_unchecked([mem_alloc])
+                .map_err(|(err, _, _)| err)?
+        });
         Ok(Arc::new(StorageImage {
-            image,
-            memory,
-            dimensions,
-            format,
-            queue_families,
-            gpu_lock: AtomicUsize::new(0),
+            inner,
+            layout_initialized: AtomicBool::new(false),
         }))
     }
-}
-
-impl<A> StorageImage<A>
-where
-    A: MemoryPool,
-{
-    /// Returns the dimensions of the image.
+    /// Allows the creation of a simple 2D general purpose image view from `StorageImage`.
     #[inline]
-    pub fn dimensions(&self) -> ImageDimensions {
-        self.dimensions
+    pub fn general_purpose_image_view(
+        allocator: &(impl MemoryAllocator + ?Sized),
+        queue: Arc<Queue>,
+        size: [u32; 2],
+        format: Format,
+        usage: ImageUsage,
+    ) -> Result<Arc<ImageView<StorageImage>>, ImageError> {
+        let dims = ImageDimensions::Dim2d {
+            width: size[0],
+            height: size[1],
+            array_layers: 1,
+        };
+        let flags = ImageCreateFlags::empty();
+        let image_result = StorageImage::with_usage(
+            allocator,
+            dims,
+            format,
+            usage,
+            flags,
+            Some(queue.queue_family_index()),
+        );
+
+        match image_result {
+            Ok(image) => {
+                let image_view = ImageView::new_default(image);
+                match image_view {
+                    Ok(view) => Ok(view),
+                    Err(e) => Err(ImageError::DirectImageViewCreationFailed(e)),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Exports posix file descriptor for the allocated memory.
+    /// Requires `khr_external_memory_fd` and `khr_external_memory` extensions to be loaded.
+    #[inline]
+    pub fn export_posix_fd(&self) -> Result<File, DeviceMemoryError> {
+        let allocation = match self.inner.memory() {
+            ImageMemory::Normal(a) => &a[0],
+            _ => unreachable!(),
+        };
+
+        allocation
+            .device_memory()
+            .export_fd(ExternalMemoryHandleType::OpaqueFd)
+    }
+
+    /// Return the size of the allocated memory (used e.g. with cuda).
+    #[inline]
+    pub fn mem_size(&self) -> DeviceSize {
+        let allocation = match self.inner.memory() {
+            ImageMemory::Normal(a) => &a[0],
+            _ => unreachable!(),
+        };
+
+        allocation.device_memory().allocation_size()
     }
 }
 
-unsafe impl<A> ImageAccess for StorageImage<A>
-where
-    A: MemoryPool,
-{
+#[cfg(target_os = "linux")]
+/// Struct that contains a Linux file descriptor for importing, when creating an image. Since a file descriptor is used for each
+/// plane in the case of multiplanar images, each fd needs to have an offset and a row pitch in order to interpret the imported data.
+pub struct SubresourceData {
+    /// The file descriptor handle of a layer of an image.
+    pub fd: RawFd,
+
+    /// The byte offset from the start of the plane where the image subresource begins.
+    pub offset: u64,
+
+    ///  Describes the number of bytes between each row of texels in an image plane.
+    pub row_pitch: u64,
+}
+
+unsafe impl DeviceOwned for StorageImage {
     #[inline]
-    fn inner(&self) -> ImageInner {
+    fn device(&self) -> &Arc<Device> {
+        self.inner.device()
+    }
+}
+
+unsafe impl ImageAccess for StorageImage {
+    #[inline]
+    fn inner(&self) -> ImageInner<'_> {
         ImageInner {
-            image: &self.image,
+            image: &self.inner,
             first_layer: 0,
-            num_layers: self.dimensions.array_layers() as usize,
+            num_layers: self.inner.dimensions().array_layers(),
             first_mipmap_level: 0,
             num_mipmap_levels: 1,
         }
@@ -207,6 +489,16 @@ where
     }
 
     #[inline]
+    unsafe fn layout_initialized(&self) {
+        self.layout_initialized.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn is_layout_initialized(&self) -> bool {
+        self.layout_initialized.load(Ordering::Relaxed)
+    }
+
+    #[inline]
     fn descriptor_layouts(&self) -> Option<ImageDescriptorLayouts> {
         Some(ImageDescriptorLayouts {
             storage_image: ImageLayout::General,
@@ -215,122 +507,86 @@ where
             input_attachment: ImageLayout::General,
         })
     }
-
-    #[inline]
-    fn conflict_key(&self) -> u64 {
-        self.image.key()
-    }
-
-    #[inline]
-    fn try_gpu_lock(
-        &self,
-        _: bool,
-        uninitialized_safe: bool,
-        expected_layout: ImageLayout,
-    ) -> Result<(), AccessError> {
-        // TODO: handle initial layout transition
-        if expected_layout != ImageLayout::General && expected_layout != ImageLayout::Undefined {
-            return Err(AccessError::UnexpectedImageLayout {
-                requested: expected_layout,
-                allowed: ImageLayout::General,
-            });
-        }
-
-        let val = self
-            .gpu_lock
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-            .unwrap_or_else(|e| e);
-        if val == 0 {
-            Ok(())
-        } else {
-            Err(AccessError::AlreadyInUse)
-        }
-    }
-
-    #[inline]
-    unsafe fn increase_gpu_lock(&self) {
-        let val = self.gpu_lock.fetch_add(1, Ordering::SeqCst);
-        debug_assert!(val >= 1);
-    }
-
-    #[inline]
-    unsafe fn unlock(&self, new_layout: Option<ImageLayout>) {
-        assert!(new_layout.is_none() || new_layout == Some(ImageLayout::General));
-        self.gpu_lock.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    #[inline]
-    fn current_miplevels_access(&self) -> std::ops::Range<u32> {
-        0..self.mipmap_levels()
-    }
-
-    #[inline]
-    fn current_layer_levels_access(&self) -> std::ops::Range<u32> {
-        0..self.dimensions().array_layers()
-    }
 }
 
-unsafe impl<A> ImageClearValue<ClearValue> for StorageImage<A>
-where
-    A: MemoryPool,
-{
-    #[inline]
-    fn decode(&self, value: ClearValue) -> Option<ClearValue> {
-        Some(self.format.decode_clear_value(value))
-    }
-}
-
-unsafe impl<P, A> ImageContent<P> for StorageImage<A>
-where
-    A: MemoryPool,
-{
-    #[inline]
+unsafe impl<P> ImageContent<P> for StorageImage {
     fn matches_format(&self) -> bool {
         true // FIXME:
     }
 }
 
-impl<A> PartialEq for StorageImage<A>
-where
-    A: MemoryPool,
-{
+impl PartialEq for StorageImage {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        ImageAccess::inner(self) == ImageAccess::inner(other)
+        self.inner() == other.inner()
     }
 }
 
-impl<A> Eq for StorageImage<A> where A: MemoryPool {}
+impl Eq for StorageImage {}
 
-impl<A> Hash for StorageImage<A>
-where
-    A: MemoryPool,
-{
-    #[inline]
+impl Hash for StorageImage {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        ImageAccess::inner(self).hash(state);
+        self.inner().hash(state);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::StorageImage;
-    use crate::format::Format;
-    use crate::image::ImageDimensions;
+    use super::*;
+    use crate::{image::view::ImageViewCreationError, memory::allocator::StandardMemoryAllocator};
 
     #[test]
     fn create() {
         let (device, queue) = gfx_dev_and_queue!();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
         let _img = StorageImage::new(
-            device,
+            &memory_allocator,
             ImageDimensions::Dim2d {
                 width: 32,
                 height: 32,
                 array_layers: 1,
             },
-            Format::R8G8B8A8Unorm,
-            Some(queue.family()),
+            Format::R8G8B8A8_UNORM,
+            Some(queue.queue_family_index()),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn create_general_purpose_image_view() {
+        let (device, queue) = gfx_dev_and_queue!();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
+        let usage =
+            ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::COLOR_ATTACHMENT;
+        let img_view = StorageImage::general_purpose_image_view(
+            &memory_allocator,
+            queue,
+            [32, 32],
+            Format::R8G8B8A8_UNORM,
+            usage,
+        )
+        .unwrap();
+        assert_eq!(img_view.image().usage(), usage);
+    }
+
+    #[test]
+    fn create_general_purpose_image_view_failed() {
+        let (device, queue) = gfx_dev_and_queue!();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
+        // Not valid for image view...
+        let usage = ImageUsage::TRANSFER_SRC;
+        let img_result = StorageImage::general_purpose_image_view(
+            &memory_allocator,
+            queue,
+            [32, 32],
+            Format::R8G8B8A8_UNORM,
+            usage,
+        );
+        assert_eq!(
+            img_result,
+            Err(ImageError::DirectImageViewCreationFailed(
+                ImageViewCreationError::ImageMissingUsage
+            ))
+        );
     }
 }

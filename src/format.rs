@@ -7,679 +7,707 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-//! All the formats of images supported by Vulkan.
+//! All the formats supported by Vulkan.
 //!
-//! # Formats
+//! A format is mostly used to describe the texel data of an image. However, formats also show up in
+//! a few other places, most notably to describe the format of vertex buffers.
 //!
-//! List of suffixes:
+//! # Format support
 //!
-//! - `Unorm` means that the values are unsigned integers that are converted into floating points.
-//!   The maximum possible representable value becomes `1.0`, and the minimum representable value
-//!   becomes `0.0`. For example the value `255` in a `R8Unorm` will be interpreted as `1.0`.
+//! Not all formats are supported by every device. Those that devices do support may only be
+//! supported for certain use cases. It is an error to use a format where it is not supported, but
+//! you can query a device beforehand for its support by calling `format_properties` on the physical
+//! device. You can use this to select a usable format from one or more suitable alternatives.
+//! Some formats are required to be always supported for a particular usage. These are listed in the
+//! [tables in the Vulkan specification](https://registry.khronos.org/vulkan/specs/1.3-extensions/html/chap43.html#features-required-format-support).
 //!
-//! - `Snorm` is the same as `Unorm`, but the integers are signed and the range is from `-1.0` to
-//!   `1.0` instead.
+//! # Special format types
 //!
-//! - `Uscaled` means that the values are unsigned integers that are converted into floating points.
-//!   No change in the value is done. For example the value `255` in a `R8Uscaled` will be
-//!   interpreted as `255.0`.
+//! ## Depth/stencil formats
 //!
-//! - `Sscaled` is the same as `Uscaled` expect that the integers are signed.
+//! Depth/stencil formats can be identified by the `D` and `S` components in their names. They are
+//! used primarily as the format for framebuffer attachments, for the purposes of depth and stencil
+//! testing.
 //!
-//! - `Uint` means that the values are unsigned integers. No conversion is performed.
+//! Some formats have only a depth or stencil component, while others combine both. The two
+//! components are represented as separate *aspects*, which means that they can be accessed
+//! individually as separate images. These pseudo-images have the same resolution, but different
+//! bit depth and numeric representation.
 //!
-//! - `Sint` means that the values are signed integers. No conversion is performed.
+//! Depth/stencil formats deviate from the others in a few more ways. Their data representation is
+//! considered opaque, meaning that they do not have a fixed layout in memory nor a fixed size per
+//! texel. They also have special limitations in several operations such as copying; a depth/stencil
+//! format is not compatible with any other format, only with itself.
 //!
-//! - `Ufloat` means that the values are unsigned floating points. No conversion is performed. This
-//!   format is very unusual.
+//! ## Block-compressed formats
 //!
-//! - `Sfloat` means that the values are regular floating points. No conversion is performed.
+//! A block-compressed format uses compression to encode a larger block of texels into a smaller
+//! number of bytes. Individual texels are no longer represented in memory, only the block as a
+//! whole. An image must consist of a whole number of blocks, so the dimensions of an image must be
+//! a whole multiple of the block dimensions. Vulkan supports several different compression schemes,
+//! represented in Vulkano by the `CompressionType` enum.
 //!
-//! - `Srgb` is the same as `Unorm`, except that the value is interpreted as being in the sRGB
-//!   color space. This means that its value will be converted to fit in the RGB color space when
-//!   it is read. The fourth channel (usually used for alpha), if present, is not concerned by the
-//!   conversion.
+//! Overall, block-compressed formats do not behave significantly differently from regular formats.
+//! They are mostly restricted in terms of compatibility. Because of the compression, the notion of
+//! bits per component does not apply, so the `components` method will only return whether a
+//! component is present or not.
 //!
-//! # Choosing a format
+//! ## YCbCr formats
 //!
-//! The following formats are guaranteed to be supported for everything that is related to
-//! texturing (ie. blitting source and sampling them linearly). You should choose one of these
-//! formats if you have an image that you are going to sample from:
+//! YCbCr, also known as YUV, is an alternative image representation with three components:
+//! Y for luminance or *luma* (overall brightness) and two color or *chroma* components Cb and Cr
+//! encoding the blueness and redness respectively. YCbCr formats are primarily used in video
+//! applications. In Vulkan, the formats used to encode YCbCr data use the green channel to
+//! represent the luma component, while the blue and red components hold the chroma.
 //!
-//! - B4G4R4A4UnormPack16
-//! - R5G6B5UnormPack16
-//! - A1R5G5B5UnormPack16
-//! - R8Unorm
-//! - R8Snorm
-//! - R8G8Unorm
-//! - R8G8Snorm
-//! - R8G8B8A8Unorm
-//! - R8G8B8A8Snorm
-//! - R8G8B8A8Srgb
-//! - B8G8R8A8Unorm
-//! - B8G8R8A8Srgb
-//! - A8B8G8R8UnormPack32
-//! - A8B8G8R8SnormPack32
-//! - A8B8G8R8SrgbPack32
-//! - A2B10G10R10UnormPack32
-//! - R16Sfloat
-//! - R16G16Sfloat
-//! - R16G16B16A16Sfloat
-//! - B10G11R11UfloatPack32
-//! - E5B9G9R9UfloatPack32
+//! To use most YCbCr formats in an [image view](crate::image::view), a
+//! [sampler YCbCr conversion](crate::sampler::ycbcr) object must be created, and attached to both
+//! the image view and the sampler. To query whether a format requires the conversion, you can call
+//! `ycbcr_chroma_sampling` on a format. As a rule, any format with `444`, `422`, `420`,
+//! `3PACK` or `4PACK` in the name requires it.
 //!
-//! The following formats are guaranteed to be supported for everything that is related to
-//! intermediate render targets (ie. blitting destination, color attachment and sampling linearly):
+//! Many YCbCr formats make use of **chroma subsampling**. This is a technique whereby the two
+//! chroma components are encoded using a lower resolution than the luma component. The human eye is
+//! less sensitive to color detail than to detail in brightness, so this allows more detail to be
+//! encoded in less data. Chroma subsampling is indicated with one of three numbered suffixes in a
+//! format name:
+//! - `444` indicates a YCbCr format without chroma subsampling. All components have the same
+//!   resolution.
+//! - `422` indicates horizontal chroma subsampling. The horizontal resolution of the chroma
+//!   components is halved, so a single value is shared within a 2x1 block of texels.
+//! - `420` indicates horizontal and vertical chroma subsampling. Both dimensions of the chroma
+//!   components are halved, so a single value is shared within a 2x2 block of texels.
 //!
-//! - R5G6B5UnormPack16
-//! - A1R5G5B5UnormPack16
-//! - R8Unorm
-//! - R8G8Unorm
-//! - R8G8B8A8Unorm
-//! - R8G8B8A8Srgb
-//! - B8G8R8A8Unorm
-//! - B8G8R8A8Srgb
-//! - A8B8G8R8UnormPack32
-//! - A8B8G8R8SrgbPack32
-//! - A2B10G10R10UnormPack32
-//! - R16Sfloat
-//! - R16G16Sfloat
-//! - R16G16B16A16Sfloat
+//! Most YCbCr formats, including all of the `444` and `420` formats, are **multi-planar**. Instead
+//! of storing the components of a single texel together in memory, the components are separated
+//! into *planes*, which act like independent images. In 3-plane formats, the planes hold the Y,
+//! Cb and Cr components respectively, while in 2-plane formats, Cb and Cr are combined into a
+//! two-component plane. Where chroma subsampling is applied, plane 0 has the full resolution, while
+//! planes 1 and 2 have reduced resolution. Effectively, they are standalone images with half the
+//! resolution of the original.
 //!
-//! For depth images, only `D16Unorm` is guaranteed to be supported. For depth-stencil images,
-//! it is guaranteed that either `D24Unorm_S8Uint` or `D32Sfloat_S8Uint` are supported.
-//!
-//! // TODO: storage formats
-//!
+//! The texels of multi-planar images cannot be accessed individually, for example to copy or blit,
+//! since the components of each texel are split across the planes. Instead, you must access each
+//! plane as an individual *aspect* of the image. A single-plane aspect of a multi-planar image
+//! behaves as a regular image, and even has its own format, which can be queried with the `plane`
+//! method on a format.
 
-use crate::device::physical::PhysicalDevice;
-use crate::image::ImageAspects;
-use crate::DeviceSize;
-use crate::VulkanObject;
-use half::f16;
-use std::convert::TryFrom;
-use std::mem::MaybeUninit;
-use std::vec::IntoIter as VecIntoIter;
-use std::{error, fmt, mem};
+use crate::{
+    device::physical::PhysicalDevice, image::ImageAspects, macros::vulkan_bitflags,
+    shader::spirv::ImageFormat, DeviceSize,
+};
 
-macro_rules! formats {
-    ($($name:ident => { vk: $vk:ident, bdim: $bdim:expr, size: $sz:expr, ty: $f_ty:ident$(, planes: $planes:expr)?},)+) => (
-        /// An enumeration of all the possible formats.
-        #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-        #[repr(i32)]
-        #[allow(missing_docs)]
-        #[allow(non_camel_case_types)]
-        pub enum Format {
-            $($name = ash::vk::Format::$vk.as_raw(),)+
-        }
-
-        impl Format {
-            /*pub fn is_supported_for_vertex_attributes(&self) -> bool {
-
-            }
-
-            .. other functions ..
-            */
-
-            /// Returns the size in bytes of an element of this format. For block based formats
-            /// this will be the size of a single block. Returns `None` if the
-            /// size is irrelevant.
-            #[inline]
-            pub const fn size(&self) -> Option<DeviceSize> {
-                match *self {
-                    $(
-                        Format::$name => $sz,
-                    )+
-                }
-            }
-
-            /// Returns (width, height) of the dimensions for block based formats. For
-            /// non block formats will return (1,1)
-            #[inline]
-            pub const fn block_dimensions(&self) -> (u32, u32) {
-                match *self {
-                    $(
-                        Format::$name => $bdim,
-                    )+
-                }
-            }
-
-            /// Returns the data type of the format.
-            #[inline]
-            pub const fn ty(&self) -> FormatTy {
-                match *self {
-                    $(
-                        Format::$name => FormatTy::$f_ty,
-                    )+
-                }
-            }
-
-            /// Returns the number of planes that images of this format have.
-            ///
-            /// Returns 0 if the format is not multi-planar.
-            #[inline]
-            pub const fn planes(&self) -> u8 {
-                match *self {
-                    $(
-                        $(Format::$name => $planes,)?
-                    )+
-                    _ => 0,
-                }
-            }
-        }
-
-        impl TryFrom<ash::vk::Format> for Format {
-            type Error = ();
-
-            #[inline]
-            fn try_from(val: ash::vk::Format) -> Result<Format, ()> {
-                match val {
-                    $(
-                        ash::vk::Format::$vk => Ok(Format::$name),
-                    )+
-                    _ => Err(()),
-                }
-            }
-        }
-
-        impl From<Format> for ash::vk::Format {
-            #[inline]
-            fn from(val: Format) -> Self {
-                ash::vk::Format::from_raw(val as i32)
-            }
-        }
-    );
-}
-
-formats! {
-    R4G4UnormPack8 => {vk: R4G4_UNORM_PACK8, bdim: (1, 1), size: Some(1), ty: Float},
-    R4G4B4A4UnormPack16 => {vk: R4G4B4A4_UNORM_PACK16, bdim: (1, 1), size: Some(2), ty: Float},
-    B4G4R4A4UnormPack16 => {vk: B4G4R4A4_UNORM_PACK16, bdim: (1, 1), size: Some(2), ty: Float},
-    R5G6B5UnormPack16 => {vk: R5G6B5_UNORM_PACK16, bdim: (1, 1), size: Some(2), ty: Float},
-    B5G6R5UnormPack16 => {vk: B5G6R5_UNORM_PACK16, bdim: (1, 1), size: Some(2), ty: Float},
-    R5G5B5A1UnormPack16 => {vk: R5G5B5A1_UNORM_PACK16, bdim: (1, 1), size: Some(2), ty: Float},
-    B5G5R5A1UnormPack16 => {vk: B5G5R5A1_UNORM_PACK16, bdim: (1, 1), size: Some(2), ty: Float},
-    A1R5G5B5UnormPack16 => {vk: A1R5G5B5_UNORM_PACK16, bdim: (1, 1), size: Some(2), ty: Float},
-    R8Unorm => {vk: R8_UNORM, bdim: (1, 1), size: Some(1), ty: Float},
-    R8Snorm => {vk: R8_SNORM, bdim: (1, 1), size: Some(1), ty: Float},
-    R8Uscaled => {vk: R8_USCALED, bdim: (1, 1), size: Some(1), ty: Float},
-    R8Sscaled => {vk: R8_SSCALED, bdim: (1, 1), size: Some(1), ty: Float},
-    R8Uint => {vk: R8_UINT, bdim: (1, 1), size: Some(1), ty: Uint},
-    R8Sint => {vk: R8_SINT, bdim: (1, 1), size: Some(1), ty: Sint},
-    R8Srgb => {vk: R8_SRGB, bdim: (1, 1), size: Some(1), ty: Float},
-    R8G8Unorm => {vk: R8G8_UNORM, bdim: (1, 1), size: Some(2), ty: Float},
-    R8G8Snorm => {vk: R8G8_SNORM, bdim: (1, 1), size: Some(2), ty: Float},
-    R8G8Uscaled => {vk: R8G8_USCALED, bdim: (1, 1), size: Some(2), ty: Float},
-    R8G8Sscaled => {vk: R8G8_SSCALED, bdim: (1, 1), size: Some(2), ty: Float},
-    R8G8Uint => {vk: R8G8_UINT, bdim: (1, 1), size: Some(2), ty: Uint},
-    R8G8Sint => {vk: R8G8_SINT, bdim: (1, 1), size: Some(2), ty: Sint},
-    R8G8Srgb => {vk: R8G8_SRGB, bdim: (1, 1), size: Some(2), ty: Float},
-    R8G8B8Unorm => {vk: R8G8B8_UNORM, bdim: (1, 1), size: Some(3), ty: Float},
-    R8G8B8Snorm => {vk: R8G8B8_SNORM, bdim: (1, 1), size: Some(3), ty: Float},
-    R8G8B8Uscaled => {vk: R8G8B8_USCALED, bdim: (1, 1), size: Some(3), ty: Float},
-    R8G8B8Sscaled => {vk: R8G8B8_SSCALED, bdim: (1, 1), size: Some(3), ty: Float},
-    R8G8B8Uint => {vk: R8G8B8_UINT, bdim: (1, 1), size: Some(3), ty: Uint},
-    R8G8B8Sint => {vk: R8G8B8_SINT, bdim: (1, 1), size: Some(3), ty: Sint},
-    R8G8B8Srgb => {vk: R8G8B8_SRGB, bdim: (1, 1), size: Some(3), ty: Float},
-    B8G8R8Unorm => {vk: B8G8R8_UNORM, bdim: (1, 1), size: Some(3), ty: Float},
-    B8G8R8Snorm => {vk: B8G8R8_SNORM, bdim: (1, 1), size: Some(3), ty: Float},
-    B8G8R8Uscaled => {vk: B8G8R8_USCALED, bdim: (1, 1), size: Some(3), ty: Float},
-    B8G8R8Sscaled => {vk: B8G8R8_SSCALED, bdim: (1, 1), size: Some(3), ty: Float},
-    B8G8R8Uint => {vk: B8G8R8_UINT, bdim: (1, 1), size: Some(3), ty: Uint},
-    B8G8R8Sint => {vk: B8G8R8_SINT, bdim: (1, 1), size: Some(3), ty: Sint},
-    B8G8R8Srgb => {vk: B8G8R8_SRGB, bdim: (1, 1), size: Some(3), ty: Float},
-    R8G8B8A8Unorm => {vk: R8G8B8A8_UNORM, bdim: (1, 1), size: Some(4), ty: Float},
-    R8G8B8A8Snorm => {vk: R8G8B8A8_SNORM, bdim: (1, 1), size: Some(4), ty: Float},
-    R8G8B8A8Uscaled => {vk: R8G8B8A8_USCALED, bdim: (1, 1), size: Some(4), ty: Float},
-    R8G8B8A8Sscaled => {vk: R8G8B8A8_SSCALED, bdim: (1, 1), size: Some(4), ty: Float},
-    R8G8B8A8Uint => {vk: R8G8B8A8_UINT, bdim: (1, 1), size: Some(4), ty: Uint},
-    R8G8B8A8Sint => {vk: R8G8B8A8_SINT, bdim: (1, 1), size: Some(4), ty: Sint},
-    R8G8B8A8Srgb => {vk: R8G8B8A8_SRGB, bdim: (1, 1), size: Some(4), ty: Float},
-    B8G8R8A8Unorm => {vk: B8G8R8A8_UNORM, bdim: (1, 1), size: Some(4), ty: Float},
-    B8G8R8A8Snorm => {vk: B8G8R8A8_SNORM, bdim: (1, 1), size: Some(4), ty: Float},
-    B8G8R8A8Uscaled => {vk: B8G8R8A8_USCALED, bdim: (1, 1), size: Some(4), ty: Float},
-    B8G8R8A8Sscaled => {vk: B8G8R8A8_SSCALED, bdim: (1, 1), size: Some(4), ty: Float},
-    B8G8R8A8Uint => {vk: B8G8R8A8_UINT, bdim: (1, 1), size: Some(4), ty: Uint},
-    B8G8R8A8Sint => {vk: B8G8R8A8_SINT, bdim: (1, 1), size: Some(4), ty: Sint},
-    B8G8R8A8Srgb => {vk: B8G8R8A8_SRGB, bdim: (1, 1), size: Some(4), ty: Float},
-    A8B8G8R8UnormPack32 => {vk: A8B8G8R8_UNORM_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A8B8G8R8SnormPack32 => {vk: A8B8G8R8_SNORM_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A8B8G8R8UscaledPack32 => {vk: A8B8G8R8_USCALED_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A8B8G8R8SscaledPack32 => {vk: A8B8G8R8_SSCALED_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A8B8G8R8UintPack32 => {vk: A8B8G8R8_UINT_PACK32, bdim: (1, 1), size: Some(4), ty: Uint},
-    A8B8G8R8SintPack32 => {vk: A8B8G8R8_SINT_PACK32, bdim: (1, 1), size: Some(4), ty: Sint},
-    A8B8G8R8SrgbPack32 => {vk: A8B8G8R8_SRGB_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A2R10G10B10UnormPack32 => {vk: A2R10G10B10_UNORM_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A2R10G10B10SnormPack32 => {vk: A2R10G10B10_SNORM_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A2R10G10B10UscaledPack32 => {vk: A2R10G10B10_USCALED_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A2R10G10B10SscaledPack32 => {vk: A2R10G10B10_SSCALED_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A2R10G10B10UintPack32 => {vk: A2R10G10B10_UINT_PACK32, bdim: (1, 1), size: Some(4), ty: Uint},
-    A2R10G10B10SintPack32 => {vk: A2R10G10B10_SINT_PACK32, bdim: (1, 1), size: Some(4), ty: Sint},
-    A2B10G10R10UnormPack32 => {vk: A2B10G10R10_UNORM_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A2B10G10R10SnormPack32 => {vk: A2B10G10R10_SNORM_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A2B10G10R10UscaledPack32 => {vk: A2B10G10R10_USCALED_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A2B10G10R10SscaledPack32 => {vk: A2B10G10R10_SSCALED_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    A2B10G10R10UintPack32 => {vk: A2B10G10R10_UINT_PACK32, bdim: (1, 1), size: Some(4), ty: Uint},
-    A2B10G10R10SintPack32 => {vk: A2B10G10R10_SINT_PACK32, bdim: (1, 1), size: Some(4), ty: Sint},
-    R16Unorm => {vk: R16_UNORM, bdim: (1, 1), size: Some(2), ty: Float},
-    R16Snorm => {vk: R16_SNORM, bdim: (1, 1), size: Some(2), ty: Float},
-    R16Uscaled => {vk: R16_USCALED, bdim: (1, 1), size: Some(2), ty: Float},
-    R16Sscaled => {vk: R16_SSCALED, bdim: (1, 1), size: Some(2), ty: Float},
-    R16Uint => {vk: R16_UINT, bdim: (1, 1), size: Some(2), ty: Uint},
-    R16Sint => {vk: R16_SINT, bdim: (1, 1), size: Some(2), ty: Sint},
-    R16Sfloat => {vk: R16_SFLOAT, bdim: (1, 1), size: Some(2), ty: Float},
-    R16G16Unorm => {vk: R16G16_UNORM, bdim: (1, 1), size: Some(4), ty: Float},
-    R16G16Snorm => {vk: R16G16_SNORM, bdim: (1, 1), size: Some(4), ty: Float},
-    R16G16Uscaled => {vk: R16G16_USCALED, bdim: (1, 1), size: Some(4), ty: Float},
-    R16G16Sscaled => {vk: R16G16_SSCALED, bdim: (1, 1), size: Some(4), ty: Float},
-    R16G16Uint => {vk: R16G16_UINT, bdim: (1, 1), size: Some(4), ty: Uint},
-    R16G16Sint => {vk: R16G16_SINT, bdim: (1, 1), size: Some(4), ty: Sint},
-    R16G16Sfloat => {vk: R16G16_SFLOAT, bdim: (1, 1), size: Some(4), ty: Float},
-    R16G16B16Unorm => {vk: R16G16B16_UNORM, bdim: (1, 1), size: Some(6), ty: Float},
-    R16G16B16Snorm => {vk: R16G16B16_SNORM, bdim: (1, 1), size: Some(6), ty: Float},
-    R16G16B16Uscaled => {vk: R16G16B16_USCALED, bdim: (1, 1), size: Some(6), ty: Float},
-    R16G16B16Sscaled => {vk: R16G16B16_SSCALED, bdim: (1, 1), size: Some(6), ty: Float},
-    R16G16B16Uint => {vk: R16G16B16_UINT, bdim: (1, 1), size: Some(6), ty: Uint},
-    R16G16B16Sint => {vk: R16G16B16_SINT, bdim: (1, 1), size: Some(6), ty: Sint},
-    R16G16B16Sfloat => {vk: R16G16B16_SFLOAT, bdim: (1, 1), size: Some(6), ty: Float},
-    R16G16B16A16Unorm => {vk: R16G16B16A16_UNORM, bdim: (1, 1), size: Some(8), ty: Float},
-    R16G16B16A16Snorm => {vk: R16G16B16A16_SNORM, bdim: (1, 1), size: Some(8), ty: Float},
-    R16G16B16A16Uscaled => {vk: R16G16B16A16_USCALED, bdim: (1, 1), size: Some(8), ty: Float},
-    R16G16B16A16Sscaled => {vk: R16G16B16A16_SSCALED, bdim: (1, 1), size: Some(8), ty: Float},
-    R16G16B16A16Uint => {vk: R16G16B16A16_UINT, bdim: (1, 1), size: Some(8), ty: Uint},
-    R16G16B16A16Sint => {vk: R16G16B16A16_SINT, bdim: (1, 1), size: Some(8), ty: Sint},
-    R16G16B16A16Sfloat => {vk: R16G16B16A16_SFLOAT, bdim: (1, 1), size: Some(8), ty: Float},
-    R32Uint => {vk: R32_UINT, bdim: (1, 1), size: Some(4), ty: Uint},
-    R32Sint => {vk: R32_SINT, bdim: (1, 1), size: Some(4), ty: Sint},
-    R32Sfloat => {vk: R32_SFLOAT, bdim: (1, 1), size: Some(4), ty: Float},
-    R32G32Uint => {vk: R32G32_UINT, bdim: (1, 1), size: Some(8), ty: Uint},
-    R32G32Sint => {vk: R32G32_SINT, bdim: (1, 1), size: Some(8), ty: Sint},
-    R32G32Sfloat => {vk: R32G32_SFLOAT, bdim: (1, 1), size: Some(8), ty: Float},
-    R32G32B32Uint => {vk: R32G32B32_UINT, bdim: (1, 1), size: Some(12), ty: Uint},
-    R32G32B32Sint => {vk: R32G32B32_SINT, bdim: (1, 1), size: Some(12), ty: Sint},
-    R32G32B32Sfloat => {vk: R32G32B32_SFLOAT, bdim: (1, 1), size: Some(12), ty: Float},
-    R32G32B32A32Uint => {vk: R32G32B32A32_UINT, bdim: (1, 1), size: Some(16), ty: Uint},
-    R32G32B32A32Sint => {vk: R32G32B32A32_SINT, bdim: (1, 1), size: Some(16), ty: Sint},
-    R32G32B32A32Sfloat => {vk: R32G32B32A32_SFLOAT, bdim: (1, 1), size: Some(16), ty: Float},
-    R64Uint => {vk: R64_UINT, bdim: (1, 1), size: Some(8), ty: Uint},
-    R64Sint => {vk: R64_SINT, bdim: (1, 1), size: Some(8), ty: Sint},
-    R64Sfloat => {vk: R64_SFLOAT, bdim: (1, 1), size: Some(8), ty: Float},
-    R64G64Uint => {vk: R64G64_UINT, bdim: (1, 1), size: Some(16), ty: Uint},
-    R64G64Sint => {vk: R64G64_SINT, bdim: (1, 1), size: Some(16), ty: Sint},
-    R64G64Sfloat => {vk: R64G64_SFLOAT, bdim: (1, 1), size: Some(16), ty: Float},
-    R64G64B64Uint => {vk: R64G64B64_UINT, bdim: (1, 1), size: Some(24), ty: Uint},
-    R64G64B64Sint => {vk: R64G64B64_SINT, bdim: (1, 1), size: Some(24), ty: Sint},
-    R64G64B64Sfloat => {vk: R64G64B64_SFLOAT, bdim: (1, 1), size: Some(24), ty: Float},
-    R64G64B64A64Uint => {vk: R64G64B64A64_UINT, bdim: (1, 1), size: Some(32), ty: Uint},
-    R64G64B64A64Sint => {vk: R64G64B64A64_SINT, bdim: (1, 1), size: Some(32), ty: Sint},
-    R64G64B64A64Sfloat => {vk: R64G64B64A64_SFLOAT, bdim: (1, 1), size: Some(32), ty: Float},
-    B10G11R11UfloatPack32 => {vk: B10G11R11_UFLOAT_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    E5B9G9R9UfloatPack32 => {vk: E5B9G9R9_UFLOAT_PACK32, bdim: (1, 1), size: Some(4), ty: Float},
-    D16Unorm => {vk: D16_UNORM, bdim: (1, 1), size: Some(2), ty: Depth},
-    X8_D24UnormPack32 => {vk: X8_D24_UNORM_PACK32, bdim: (1, 1), size: Some(4), ty: Depth},
-    D32Sfloat => {vk: D32_SFLOAT, bdim: (1, 1), size: Some(4), ty: Depth},
-    S8Uint => {vk: S8_UINT, bdim: (1, 1), size: Some(1), ty: Stencil},
-    D16Unorm_S8Uint => {vk: D16_UNORM_S8_UINT, bdim: (1, 1), size: None, ty: DepthStencil},
-    D24Unorm_S8Uint => {vk: D24_UNORM_S8_UINT, bdim: (1, 1), size: None, ty: DepthStencil},
-    D32Sfloat_S8Uint => {vk: D32_SFLOAT_S8_UINT, bdim: (1, 1), size: None, ty: DepthStencil},
-    BC1_RGBUnormBlock => {vk: BC1_RGB_UNORM_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    BC1_RGBSrgbBlock => {vk: BC1_RGB_SRGB_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    BC1_RGBAUnormBlock => {vk: BC1_RGBA_UNORM_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    BC1_RGBASrgbBlock => {vk: BC1_RGBA_SRGB_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    BC2UnormBlock => {vk: BC2_UNORM_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    BC2SrgbBlock => {vk: BC2_SRGB_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    BC3UnormBlock => {vk: BC3_UNORM_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    BC3SrgbBlock => {vk: BC3_SRGB_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    BC4UnormBlock => {vk: BC4_UNORM_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    BC4SnormBlock => {vk: BC4_SNORM_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    BC5UnormBlock => {vk: BC5_UNORM_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    BC5SnormBlock => {vk: BC5_SNORM_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    BC6HUfloatBlock => {vk: BC6H_UFLOAT_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    BC6HSfloatBlock => {vk: BC6H_SFLOAT_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    BC7UnormBlock => {vk: BC7_UNORM_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    BC7SrgbBlock => {vk: BC7_SRGB_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    ETC2_R8G8B8UnormBlock => {vk: ETC2_R8G8B8_UNORM_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    ETC2_R8G8B8SrgbBlock => {vk: ETC2_R8G8B8_SRGB_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    ETC2_R8G8B8A1UnormBlock => {vk: ETC2_R8G8B8A1_UNORM_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    ETC2_R8G8B8A1SrgbBlock => {vk: ETC2_R8G8B8A1_SRGB_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    ETC2_R8G8B8A8UnormBlock => {vk: ETC2_R8G8B8A8_UNORM_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    ETC2_R8G8B8A8SrgbBlock => {vk: ETC2_R8G8B8A8_SRGB_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    EAC_R11UnormBlock => {vk: EAC_R11_UNORM_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    EAC_R11SnormBlock => {vk: EAC_R11_SNORM_BLOCK, bdim: (4, 4), size: Some(8), ty: Compressed},
-    EAC_R11G11UnormBlock => {vk: EAC_R11G11_UNORM_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    EAC_R11G11SnormBlock => {vk: EAC_R11G11_SNORM_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    ASTC_4x4UnormBlock => {vk: ASTC_4X4_UNORM_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    ASTC_4x4SrgbBlock => {vk: ASTC_4X4_SRGB_BLOCK, bdim: (4, 4), size: Some(16), ty: Compressed},
-    ASTC_5x4UnormBlock => {vk: ASTC_5X4_UNORM_BLOCK, bdim: (5, 4), size: Some(16), ty: Compressed},
-    ASTC_5x4SrgbBlock => {vk: ASTC_5X4_SRGB_BLOCK, bdim: (5, 4), size: Some(16), ty: Compressed},
-    ASTC_5x5UnormBlock => {vk: ASTC_5X5_UNORM_BLOCK, bdim: (5, 5), size: Some(16), ty: Compressed},
-    ASTC_5x5SrgbBlock => {vk: ASTC_5X5_SRGB_BLOCK, bdim: (5, 5), size: Some(16), ty: Compressed},
-    ASTC_6x5UnormBlock => {vk: ASTC_6X5_UNORM_BLOCK, bdim: (6, 5), size: Some(16), ty: Compressed},
-    ASTC_6x5SrgbBlock => {vk: ASTC_6X5_SRGB_BLOCK, bdim: (6, 5), size: Some(16), ty: Compressed},
-    ASTC_6x6UnormBlock => {vk: ASTC_6X6_UNORM_BLOCK, bdim: (6, 6), size: Some(16), ty: Compressed},
-    ASTC_6x6SrgbBlock => {vk: ASTC_6X6_SRGB_BLOCK, bdim: (6, 6), size: Some(16), ty: Compressed},
-    ASTC_8x5UnormBlock => {vk: ASTC_8X5_UNORM_BLOCK, bdim: (8, 5), size: Some(16), ty: Compressed},
-    ASTC_8x5SrgbBlock => {vk: ASTC_8X5_SRGB_BLOCK, bdim: (8, 5), size: Some(16), ty: Compressed},
-    ASTC_8x6UnormBlock => {vk: ASTC_8X6_UNORM_BLOCK, bdim: (8, 6), size: Some(16), ty: Compressed},
-    ASTC_8x6SrgbBlock => {vk: ASTC_8X6_SRGB_BLOCK, bdim: (8, 6), size: Some(16), ty: Compressed},
-    ASTC_8x8UnormBlock => {vk: ASTC_8X8_UNORM_BLOCK, bdim: (8, 8), size: Some(16), ty: Compressed},
-    ASTC_8x8SrgbBlock => {vk: ASTC_8X8_SRGB_BLOCK, bdim: (8, 8), size: Some(16), ty: Compressed},
-    ASTC_10x5UnormBlock => {vk: ASTC_10X5_UNORM_BLOCK, bdim: (10, 5), size: Some(16), ty: Compressed},
-    ASTC_10x5SrgbBlock => {vk: ASTC_10X5_SRGB_BLOCK, bdim: (10, 5), size: Some(16), ty: Compressed},
-    ASTC_10x6UnormBlock => {vk: ASTC_10X6_UNORM_BLOCK, bdim: (10, 6), size: Some(16), ty: Compressed},
-    ASTC_10x6SrgbBlock => {vk: ASTC_10X6_SRGB_BLOCK, bdim: (10, 6), size: Some(16), ty: Compressed},
-    ASTC_10x8UnormBlock => {vk: ASTC_10X8_UNORM_BLOCK, bdim: (10, 8), size: Some(16), ty: Compressed},
-    ASTC_10x8SrgbBlock => {vk: ASTC_10X8_SRGB_BLOCK, bdim: (10, 8), size: Some(16), ty: Compressed},
-    ASTC_10x10UnormBlock => {vk: ASTC_10X10_UNORM_BLOCK, bdim: (10, 10), size: Some(16), ty: Compressed},
-    ASTC_10x10SrgbBlock => {vk: ASTC_10X10_SRGB_BLOCK, bdim: (10, 10), size: Some(16), ty: Compressed},
-    ASTC_12x10UnormBlock => {vk: ASTC_12X10_UNORM_BLOCK, bdim: (12, 10), size: Some(16), ty: Compressed},
-    ASTC_12x10SrgbBlock => {vk: ASTC_12X10_SRGB_BLOCK, bdim: (12, 10), size: Some(16), ty: Compressed},
-    ASTC_12x12UnormBlock => {vk: ASTC_12X12_UNORM_BLOCK, bdim: (12, 12), size: Some(16), ty: Compressed},
-    ASTC_12x12SrgbBlock => {vk: ASTC_12X12_SRGB_BLOCK, bdim: (12, 12), size: Some(16), ty: Compressed},
-    G8B8R8_3PLANE420Unorm => {vk: G8_B8_R8_3PLANE_420_UNORM, bdim: (1, 1), size: None, ty: Ycbcr, planes: 3},
-    G8B8R8_2PLANE420Unorm => {vk: G8_B8R8_2PLANE_420_UNORM, bdim: (1, 1), size: None, ty: Ycbcr, planes: 2},
-}
+// Generated by build.rs
+include!(concat!(env!("OUT_DIR"), "/formats.rs"));
 
 impl Format {
-    /// Returns the aspects that images of this format have.
-    #[inline]
-    pub const fn aspects(&self) -> ImageAspects {
-        let ty = self.ty();
-        let planes = self.planes();
-        ImageAspects {
-            color: matches!(
-                ty,
-                FormatTy::Float | FormatTy::Uint | FormatTy::Sint | FormatTy::Compressed
-            ),
-            depth: matches!(ty, FormatTy::Depth | FormatTy::DepthStencil),
-            stencil: matches!(ty, FormatTy::Stencil | FormatTy::DepthStencil),
-            plane0: planes >= 1,
-            plane1: planes >= 2,
-            plane2: planes >= 3,
-            ..ImageAspects::none()
-        }
-    }
-
     /// Retrieves the properties of a format when used by a certain device.
+    #[deprecated(
+        since = "0.28.0",
+        note = "Use PhysicalDevice::format_properties instead"
+    )]
     #[inline]
-    pub fn properties(&self, physical_device: PhysicalDevice) -> FormatProperties {
-        let vk_properties = unsafe {
-            let fns_i = physical_device.instance().fns();
-            let mut output = MaybeUninit::uninit();
-            fns_i.v1_0.get_physical_device_format_properties(
-                physical_device.internal_object(),
-                (*self).into(),
-                output.as_mut_ptr(),
-            );
-            output.assume_init()
-        };
-
-        FormatProperties {
-            linear_tiling_features: vk_properties.linear_tiling_features.into(),
-            optimal_tiling_features: vk_properties.optimal_tiling_features.into(),
-            buffer_features: vk_properties.buffer_features.into(),
-        }
+    pub fn properties(self, physical_device: PhysicalDevice) -> FormatProperties {
+        physical_device.format_properties(self).unwrap()
     }
 
+    /// Returns whether the format can be used with a storage image, without specifying
+    /// the format in the shader, if the
+    /// [`shader_storage_image_read_without_format`](crate::device::Features::shader_storage_image_read_without_format)
+    /// and/or
+    /// [`shader_storage_image_write_without_format`](crate::device::Features::shader_storage_image_write_without_format)
+    /// features are enabled on the device.
     #[inline]
-    pub fn decode_clear_value(&self, value: ClearValue) -> ClearValue {
-        match (self.ty(), value) {
-            (FormatTy::Float, f @ ClearValue::Float(_)) => f,
-            (FormatTy::Compressed, f @ ClearValue::Float(_)) => f,
-            (FormatTy::Sint, f @ ClearValue::Int(_)) => f,
-            (FormatTy::Uint, f @ ClearValue::Uint(_)) => f,
-            (FormatTy::Depth, f @ ClearValue::Depth(_)) => f,
-            (FormatTy::Stencil, f @ ClearValue::Stencil(_)) => f,
-            (FormatTy::DepthStencil, f @ ClearValue::DepthStencil(_)) => f,
-            _ => panic!("Wrong clear value"),
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum FormatTy {
-    Float,
-    Uint,
-    Sint,
-    Depth,
-    Stencil,
-    DepthStencil,
-    Compressed,
-    Ycbcr,
-}
-
-/// Trait for Rust types that can represent a pixel in an image.
-pub unsafe trait Pixel {
-    /// Returns an error if `Self` cannot be used as a source of pixels for `format`.
-    fn ensure_accepts(format: Format) -> Result<(), IncompatiblePixelsType>;
-
-    /// The number of `Self`s which make up a single pixel.
-    ///
-    /// # Panics
-    ///
-    /// May panic if `ensure_accepts` would not return `Ok(())`.
-    fn rate(format: Format) -> u32;
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct IncompatiblePixelsType;
-
-impl error::Error for IncompatiblePixelsType {}
-
-impl fmt::Display for IncompatiblePixelsType {
-    #[inline]
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(
-            fmt,
-            "{}",
-            "supplied pixels' type is incompatible with this format"
+    pub fn shader_storage_image_without_format(self) -> bool {
+        matches!(
+            self,
+            Format::R8G8B8A8_UNORM
+                | Format::R8G8B8A8_SNORM
+                | Format::R8G8B8A8_UINT
+                | Format::R8G8B8A8_SINT
+                | Format::R32_UINT
+                | Format::R32_SINT
+                | Format::R32_SFLOAT
+                | Format::R32G32_UINT
+                | Format::R32G32_SINT
+                | Format::R32G32_SFLOAT
+                | Format::R32G32B32A32_UINT
+                | Format::R32G32B32A32_SINT
+                | Format::R32G32B32A32_SFLOAT
+                | Format::R16G16B16A16_UINT
+                | Format::R16G16B16A16_SINT
+                | Format::R16G16B16A16_SFLOAT
+                | Format::R16G16_SFLOAT
+                | Format::B10G11R11_UFLOAT_PACK32
+                | Format::R16_SFLOAT
+                | Format::R16G16B16A16_UNORM
+                | Format::A2B10G10R10_UNORM_PACK32
+                | Format::R16G16_UNORM
+                | Format::R8G8_UNORM
+                | Format::R16_UNORM
+                | Format::R8_UNORM
+                | Format::R16G16B16A16_SNORM
+                | Format::R16G16_SNORM
+                | Format::R8G8_SNORM
+                | Format::R16_SNORM
+                | Format::R8_SNORM
+                | Format::R16G16_SINT
+                | Format::R8G8_SINT
+                | Format::R16_SINT
+                | Format::R8_SINT
+                | Format::A2B10G10R10_UINT_PACK32
+                | Format::R16G16_UINT
+                | Format::R8G8_UINT
+                | Format::R16_UINT
+                | Format::R8_UINT
         )
     }
 }
 
-macro_rules! impl_pixel {
-    {$($ty:ty;)+} => {
-        $(impl_pixel!(inner $ty);)*
-        $(impl_pixel!(inner [$ty; 1]);)*
-        $(impl_pixel!(inner [$ty; 2]);)*
-        $(impl_pixel!(inner [$ty; 3]);)*
-        $(impl_pixel!(inner [$ty; 4]);)*
-        $(impl_pixel!(inner ($ty,));)*
-        $(impl_pixel!(inner ($ty, $ty));)*
-        $(impl_pixel!(inner ($ty, $ty, $ty));)*
-        $(impl_pixel!(inner ($ty, $ty, $ty, $ty));)*
-    };
-    (inner $ty:ty) => {
-        unsafe impl Pixel for $ty {
-            fn ensure_accepts(format: Format) -> Result<(), IncompatiblePixelsType> {
-                // TODO: Be more strict: accept only if the format has a matching AcceptsPixels impl.
-                if format.size().map_or(false, |x| x % mem::size_of::<$ty>() as DeviceSize == 0) {
-                    Ok(())
-                } else {
-                    Err(IncompatiblePixelsType)
-                }
-            }
+impl From<Format> for ash::vk::Format {
+    #[inline]
+    fn from(val: Format) -> Self {
+        ash::vk::Format::from_raw(val as i32)
+    }
+}
 
-            fn rate(format: Format) -> u32 {
-                (format.size().expect("this format cannot accept pixels") / mem::size_of::<$ty>() as DeviceSize) as u32
-            }
+// https://registry.khronos.org/vulkan/specs/1.3-extensions/html/chap46.html#spirvenv-image-formats
+impl From<ImageFormat> for Option<Format> {
+    #[inline]
+    fn from(val: ImageFormat) -> Self {
+        match val {
+            ImageFormat::Unknown => None,
+            ImageFormat::Rgba32f => Some(Format::R32G32B32A32_SFLOAT),
+            ImageFormat::Rgba16f => Some(Format::R16G16B16A16_SFLOAT),
+            ImageFormat::R32f => Some(Format::R32_SFLOAT),
+            ImageFormat::Rgba8 => Some(Format::R8G8B8A8_UNORM),
+            ImageFormat::Rgba8Snorm => Some(Format::R8G8B8A8_SNORM),
+            ImageFormat::Rg32f => Some(Format::R32G32_SFLOAT),
+            ImageFormat::Rg16f => Some(Format::R16G16_SFLOAT),
+            ImageFormat::R11fG11fB10f => Some(Format::B10G11R11_UFLOAT_PACK32),
+            ImageFormat::R16f => Some(Format::R16_SFLOAT),
+            ImageFormat::Rgba16 => Some(Format::R16G16B16A16_UNORM),
+            ImageFormat::Rgb10A2 => Some(Format::A2B10G10R10_UNORM_PACK32),
+            ImageFormat::Rg16 => Some(Format::R16G16_UNORM),
+            ImageFormat::Rg8 => Some(Format::R8G8_UNORM),
+            ImageFormat::R16 => Some(Format::R16_UNORM),
+            ImageFormat::R8 => Some(Format::R8_UNORM),
+            ImageFormat::Rgba16Snorm => Some(Format::R16G16B16A16_SNORM),
+            ImageFormat::Rg16Snorm => Some(Format::R16G16_SNORM),
+            ImageFormat::Rg8Snorm => Some(Format::R8G8_SNORM),
+            ImageFormat::R16Snorm => Some(Format::R16_SNORM),
+            ImageFormat::R8Snorm => Some(Format::R8_SNORM),
+            ImageFormat::Rgba32i => Some(Format::R32G32B32A32_SINT),
+            ImageFormat::Rgba16i => Some(Format::R16G16B16A16_SINT),
+            ImageFormat::Rgba8i => Some(Format::R8G8B8A8_SINT),
+            ImageFormat::R32i => Some(Format::R32_SINT),
+            ImageFormat::Rg32i => Some(Format::R32G32_SINT),
+            ImageFormat::Rg16i => Some(Format::R16G16_SINT),
+            ImageFormat::Rg8i => Some(Format::R8G8_SINT),
+            ImageFormat::R16i => Some(Format::R16_SINT),
+            ImageFormat::R8i => Some(Format::R8_SINT),
+            ImageFormat::Rgba32ui => Some(Format::R32G32B32A32_UINT),
+            ImageFormat::Rgba16ui => Some(Format::R16G16B16A16_UINT),
+            ImageFormat::Rgba8ui => Some(Format::R8G8B8A8_UINT),
+            ImageFormat::R32ui => Some(Format::R32_UINT),
+            ImageFormat::Rgb10a2ui => Some(Format::A2B10G10R10_UINT_PACK32),
+            ImageFormat::Rg32ui => Some(Format::R32G32_UINT),
+            ImageFormat::Rg16ui => Some(Format::R16G16_UINT),
+            ImageFormat::Rg8ui => Some(Format::R8G8_UINT),
+            ImageFormat::R16ui => Some(Format::R16_UINT),
+            ImageFormat::R8ui => Some(Format::R8_UINT),
+            ImageFormat::R64ui => Some(Format::R64_UINT),
+            ImageFormat::R64i => Some(Format::R64_SINT),
         }
     }
 }
 
-impl_pixel! {
-    u8; i8; u16; i16; u32; i32; u64; i64; f16; f32; f64;
+/// The block compression scheme used in a format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
+pub enum CompressionType {
+    /// Adaptive Scalable Texture Compression, low dynamic range.
+    ASTC_LDR,
+    /// Adaptive Scalable Texture Compression, high dynamic range.
+    ASTC_HDR,
+    /// S3TC Block Compression.
+    BC,
+    /// Ericsson Texture Compression 2.
+    ETC2,
+    /// ETC2 Alpha Compression.
+    EAC,
+    /// PowerVR Texture Compression.
+    PVRTC,
+}
+
+/// For YCbCr formats, the type of chroma sampling used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChromaSampling {
+    /// The chroma components are represented at the same resolution as the luma component.
+    Mode444,
+    /// The chroma components have half the horizontal resolution as the luma component.
+    Mode422,
+    /// The chroma components have half the horizontal and vertical resolution as the luma
+    /// component.
+    Mode420,
+}
+
+impl ChromaSampling {
+    #[inline]
+    pub fn subsampled_extent(self, mut extent: [u32; 3]) -> [u32; 3] {
+        match self {
+            ChromaSampling::Mode444 => (),
+            ChromaSampling::Mode422 => {
+                debug_assert!(extent[0] % 2 == 0);
+                extent[0] /= 2;
+            }
+            ChromaSampling::Mode420 => {
+                debug_assert!(extent[0] % 2 == 0 && extent[1] % 2 == 0);
+                extent[0] /= 2;
+                extent[1] /= 2;
+            }
+        }
+
+        extent
+    }
+}
+
+/// The numeric type that represents data of a format in memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumericType {
+    /// Signed floating-point number.
+    SFLOAT,
+    /// Unsigned floating-point number.
+    UFLOAT,
+    /// Signed integer.
+    SINT,
+    /// Unsigned integer.
+    UINT,
+    /// Signed integer that represents a normalized floating-point value in the range \[-1,1].
+    SNORM,
+    /// Unsigned integer that represents a normalized floating-point value in the range \[0,1].
+    UNORM,
+    /// Signed integer that is converted to a floating-point value directly.
+    SSCALED,
+    /// Unsigned integer that is converted to a floating-point value directly.
+    USCALED,
+    /// Unsigned integer where R, G, B components represent a normalized floating-point value in the
+    /// sRGB color space, while the A component is a simple normalized value as in `UNORM`.
+    SRGB,
+}
+
+/// An opaque type that represents a format compatibility class.
+///
+/// Two formats are compatible if their compatibility classes compare equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct FormatCompatibility(pub(crate) &'static FormatCompatibilityInner);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
+pub(crate) enum FormatCompatibilityInner {
+    Class_8bit,
+    Class_16bit,
+    Class_24bit,
+    Class_32bit,
+    Class_48bit,
+    Class_64bit,
+    Class_96bit,
+    Class_128bit,
+    Class_192bit,
+    Class_256bit,
+    Class_D16,
+    Class_D24,
+    Class_D32,
+    Class_S8,
+    Class_D16S8,
+    Class_D24S8,
+    Class_D32S8,
+    Class_64bit_R10G10B10A10,
+    Class_64bit_R12G12B12A12,
+    Class_BC1_RGB,
+    Class_BC1_RGBA,
+    Class_BC2,
+    Class_BC3,
+    Class_BC4,
+    Class_BC5,
+    Class_BC6H,
+    Class_BC7,
+    Class_ETC2_RGB,
+    Class_ETC2_RGBA,
+    Class_ETC2_EAC_RGBA,
+    Class_EAC_R,
+    Class_EAC_RG,
+    Class_ASTC_4x4,
+    Class_ASTC_5x4,
+    Class_ASTC_5x5,
+    Class_ASTC_6x5,
+    Class_ASTC_6x6,
+    Class_ASTC_8x5,
+    Class_ASTC_8x6,
+    Class_ASTC_8x8,
+    Class_ASTC_10x5,
+    Class_ASTC_10x6,
+    Class_ASTC_10x8,
+    Class_ASTC_10x10,
+    Class_ASTC_12x10,
+    Class_ASTC_12x12,
+    Class_PVRTC1_2BPP,
+    Class_PVRTC1_4BPP,
+    Class_PVRTC2_2BPP,
+    Class_PVRTC2_4BPP,
+    Class_32bit_G8B8G8R8,
+    Class_32bit_B8G8R8G8,
+    Class_64bit_G10B10G10R10,
+    Class_64bit_B10G10R10G10,
+    Class_64bit_G12B12G12R12,
+    Class_64bit_B12G12R12G12,
+    Class_64bit_G16B16G16R16,
+    Class_64bit_B16G16R16G16,
+    Class_8bit_3plane_420,
+    Class_8bit_2plane_420,
+    Class_10bit_3plane_420,
+    Class_10bit_2plane_420,
+    Class_12bit_3plane_420,
+    Class_12bit_2plane_420,
+    Class_16bit_3plane_420,
+    Class_16bit_2plane_420,
+    Class_8bit_3plane_422,
+    Class_8bit_2plane_422,
+    Class_10bit_3plane_422,
+    Class_10bit_2plane_422,
+    Class_12bit_3plane_422,
+    Class_12bit_2plane_422,
+    Class_16bit_3plane_422,
+    Class_16bit_2plane_422,
+    Class_8bit_3plane_444,
+    Class_10bit_3plane_444,
+    Class_12bit_3plane_444,
+    Class_16bit_3plane_444,
+    Class_8bit_2plane_444,
+    Class_10bit_2plane_444,
+    Class_12bit_2plane_444,
+    Class_16bit_2plane_444,
 }
 
 /// Describes a uniform value that will be used to fill an image.
-// TODO: should have the same layout as `vk::ClearValue` for performance
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ClearValue {
-    /// Entry for attachments that aren't cleared.
-    None,
-    /// Value for floating-point attachments, including `Unorm`, `Snorm`, `Sfloat`.
+    /// Value for floating-point attachments, including `UNORM`, `SNORM`, `SFLOAT`.
     Float([f32; 4]),
-    /// Value for integer attachments, including `Int`.
+
+    /// Value for integer attachments, including `SINT`.
     Int([i32; 4]),
-    /// Value for unsigned integer attachments, including `Uint`.
+
+    /// Value for unsigned integer attachments, including `UINT`.
     Uint([u32; 4]),
+
     /// Value for depth attachments.
     Depth(f32),
+
     /// Value for stencil attachments.
     Stencil(u32),
+
     /// Value for depth and stencil attachments.
     DepthStencil((f32, u32)),
 }
 
-// TODO: remove all these From implementations once they are no longer needed
+impl From<ClearValue> for ash::vk::ClearValue {
+    #[inline]
+    fn from(val: ClearValue) -> Self {
+        match val {
+            ClearValue::Float(val) => Self {
+                color: ash::vk::ClearColorValue { float32: val },
+            },
+            ClearValue::Int(val) => Self {
+                color: ash::vk::ClearColorValue { int32: val },
+            },
+            ClearValue::Uint(val) => Self {
+                color: ash::vk::ClearColorValue { uint32: val },
+            },
+            ClearValue::Depth(depth) => Self {
+                depth_stencil: ash::vk::ClearDepthStencilValue { depth, stencil: 0 },
+            },
+            ClearValue::Stencil(stencil) => Self {
+                depth_stencil: ash::vk::ClearDepthStencilValue {
+                    depth: 0.0,
+                    stencil,
+                },
+            },
+            ClearValue::DepthStencil((depth, stencil)) => Self {
+                depth_stencil: ash::vk::ClearDepthStencilValue { depth, stencil },
+            },
+        }
+    }
+}
+
+impl From<ClearColorValue> for ClearValue {
+    #[inline]
+    fn from(val: ClearColorValue) -> Self {
+        match val {
+            ClearColorValue::Float(val) => Self::Float(val),
+            ClearColorValue::Int(val) => Self::Int(val),
+            ClearColorValue::Uint(val) => Self::Uint(val),
+        }
+    }
+}
 
 impl From<[f32; 1]> for ClearValue {
     #[inline]
-    fn from(val: [f32; 1]) -> ClearValue {
-        ClearValue::Float([val[0], 0.0, 0.0, 1.0])
+    fn from(val: [f32; 1]) -> Self {
+        Self::Float([val[0], 0.0, 0.0, 1.0])
     }
 }
 
 impl From<[f32; 2]> for ClearValue {
     #[inline]
-    fn from(val: [f32; 2]) -> ClearValue {
-        ClearValue::Float([val[0], val[1], 0.0, 1.0])
+    fn from(val: [f32; 2]) -> Self {
+        Self::Float([val[0], val[1], 0.0, 1.0])
     }
 }
 
 impl From<[f32; 3]> for ClearValue {
     #[inline]
-    fn from(val: [f32; 3]) -> ClearValue {
-        ClearValue::Float([val[0], val[1], val[2], 1.0])
+    fn from(val: [f32; 3]) -> Self {
+        Self::Float([val[0], val[1], val[2], 1.0])
     }
 }
 
 impl From<[f32; 4]> for ClearValue {
     #[inline]
-    fn from(val: [f32; 4]) -> ClearValue {
-        ClearValue::Float(val)
+    fn from(val: [f32; 4]) -> Self {
+        Self::Float(val)
     }
 }
 
 impl From<[u32; 1]> for ClearValue {
     #[inline]
-    fn from(val: [u32; 1]) -> ClearValue {
-        ClearValue::Uint([val[0], 0, 0, 0]) // TODO: is alpha value 0 correct?
+    fn from(val: [u32; 1]) -> Self {
+        Self::Uint([val[0], 0, 0, 0]) // TODO: is alpha value 0 correct?
     }
 }
 
 impl From<[u32; 2]> for ClearValue {
     #[inline]
-    fn from(val: [u32; 2]) -> ClearValue {
-        ClearValue::Uint([val[0], val[1], 0, 0]) // TODO: is alpha value 0 correct?
+    fn from(val: [u32; 2]) -> Self {
+        Self::Uint([val[0], val[1], 0, 0]) // TODO: is alpha value 0 correct?
     }
 }
 
 impl From<[u32; 3]> for ClearValue {
     #[inline]
-    fn from(val: [u32; 3]) -> ClearValue {
-        ClearValue::Uint([val[0], val[1], val[2], 0]) // TODO: is alpha value 0 correct?
+    fn from(val: [u32; 3]) -> Self {
+        Self::Uint([val[0], val[1], val[2], 0]) // TODO: is alpha value 0 correct?
     }
 }
 
 impl From<[u32; 4]> for ClearValue {
     #[inline]
-    fn from(val: [u32; 4]) -> ClearValue {
-        ClearValue::Uint(val)
+    fn from(val: [u32; 4]) -> Self {
+        Self::Uint(val)
     }
 }
 
 impl From<[i32; 1]> for ClearValue {
     #[inline]
-    fn from(val: [i32; 1]) -> ClearValue {
-        ClearValue::Int([val[0], 0, 0, 0]) // TODO: is alpha value 0 correct?
+    fn from(val: [i32; 1]) -> Self {
+        Self::Int([val[0], 0, 0, 0]) // TODO: is alpha value 0 correct?
     }
 }
 
 impl From<[i32; 2]> for ClearValue {
     #[inline]
-    fn from(val: [i32; 2]) -> ClearValue {
-        ClearValue::Int([val[0], val[1], 0, 0]) // TODO: is alpha value 0 correct?
+    fn from(val: [i32; 2]) -> Self {
+        Self::Int([val[0], val[1], 0, 0]) // TODO: is alpha value 0 correct?
     }
 }
 
 impl From<[i32; 3]> for ClearValue {
     #[inline]
-    fn from(val: [i32; 3]) -> ClearValue {
-        ClearValue::Int([val[0], val[1], val[2], 0]) // TODO: is alpha value 0 correct?
+    fn from(val: [i32; 3]) -> Self {
+        Self::Int([val[0], val[1], val[2], 0]) // TODO: is alpha value 0 correct?
     }
 }
 
 impl From<[i32; 4]> for ClearValue {
     #[inline]
-    fn from(val: [i32; 4]) -> ClearValue {
-        ClearValue::Int(val)
+    fn from(val: [i32; 4]) -> Self {
+        Self::Int(val)
     }
 }
 
 impl From<f32> for ClearValue {
     #[inline]
-    fn from(val: f32) -> ClearValue {
-        ClearValue::Depth(val)
+    fn from(val: f32) -> Self {
+        Self::Depth(val)
     }
 }
 
 impl From<u32> for ClearValue {
     #[inline]
-    fn from(val: u32) -> ClearValue {
-        ClearValue::Stencil(val)
+    fn from(val: u32) -> Self {
+        Self::Stencil(val)
     }
 }
 
 impl From<(f32, u32)> for ClearValue {
     #[inline]
-    fn from(val: (f32, u32)) -> ClearValue {
-        ClearValue::DepthStencil(val)
+    fn from(val: (f32, u32)) -> Self {
+        Self::DepthStencil(val)
     }
 }
 
-// TODO: remove once no longer needed
-pub unsafe trait ClearValuesTuple {
-    type Iter: Iterator<Item = ClearValue>;
-    fn iter(self) -> Self::Iter;
+/// A value that will be used to clear a color image.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ClearColorValue {
+    /// Value for formats with a numeric type that is not `SINT` or `UINT`.
+    Float([f32; 4]),
+    /// Value for formats with a numeric type of `SINT`.
+    Int([i32; 4]),
+    /// Value for formats with a numeric type of `UINT`.
+    Uint([u32; 4]),
 }
 
-macro_rules! impl_clear_values_tuple {
-    ($first:ident $($others:ident)+) => (
-        #[allow(non_snake_case)]
-        unsafe impl<$first $(, $others)*> ClearValuesTuple for ($first, $($others,)+)
-            where $first: Into<ClearValue> $(, $others: Into<ClearValue>)*
-        {
-            type Iter = VecIntoIter<ClearValue>;
-            #[inline]
-            fn iter(self) -> VecIntoIter<ClearValue> {
-                let ($first, $($others,)+) = self;
-                vec![
-                    $first.into() $(, $others.into())+
-                ].into_iter()
-            }
+impl From<ClearColorValue> for ash::vk::ClearColorValue {
+    #[inline]
+    fn from(val: ClearColorValue) -> Self {
+        match val {
+            ClearColorValue::Float(float32) => Self { float32 },
+            ClearColorValue::Int(int32) => Self { int32 },
+            ClearColorValue::Uint(uint32) => Self { uint32 },
         }
-
-        impl_clear_values_tuple!($($others)*);
-    );
-
-    ($first:ident) => (
-        unsafe impl<$first> ClearValuesTuple for ($first,)
-            where $first: Into<ClearValue>
-        {
-            type Iter = VecIntoIter<ClearValue>;
-            #[inline]
-            fn iter(self) -> VecIntoIter<ClearValue> {
-                vec![self.0.into()].into_iter()
-            }
-        }
-    );
+    }
 }
 
-impl_clear_values_tuple!(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z);
+impl From<[f32; 1]> for ClearColorValue {
+    #[inline]
+    fn from(val: [f32; 1]) -> Self {
+        Self::Float([val[0], 0.0, 0.0, 1.0])
+    }
+}
 
-/// The properties of an image format that are supported by a physical device.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+impl From<[f32; 2]> for ClearColorValue {
+    #[inline]
+    fn from(val: [f32; 2]) -> Self {
+        Self::Float([val[0], val[1], 0.0, 1.0])
+    }
+}
+
+impl From<[f32; 3]> for ClearColorValue {
+    #[inline]
+    fn from(val: [f32; 3]) -> Self {
+        Self::Float([val[0], val[1], val[2], 1.0])
+    }
+}
+
+impl From<[f32; 4]> for ClearColorValue {
+    #[inline]
+    fn from(val: [f32; 4]) -> Self {
+        Self::Float(val)
+    }
+}
+
+impl From<[i32; 1]> for ClearColorValue {
+    #[inline]
+    fn from(val: [i32; 1]) -> Self {
+        Self::Int([val[0], 0, 0, 1])
+    }
+}
+
+impl From<[i32; 2]> for ClearColorValue {
+    #[inline]
+    fn from(val: [i32; 2]) -> Self {
+        Self::Int([val[0], val[1], 0, 1])
+    }
+}
+
+impl From<[i32; 3]> for ClearColorValue {
+    #[inline]
+    fn from(val: [i32; 3]) -> Self {
+        Self::Int([val[0], val[1], val[2], 1])
+    }
+}
+
+impl From<[i32; 4]> for ClearColorValue {
+    #[inline]
+    fn from(val: [i32; 4]) -> Self {
+        Self::Int(val)
+    }
+}
+
+impl From<[u32; 1]> for ClearColorValue {
+    #[inline]
+    fn from(val: [u32; 1]) -> Self {
+        Self::Uint([val[0], 0, 0, 1])
+    }
+}
+
+impl From<[u32; 2]> for ClearColorValue {
+    #[inline]
+    fn from(val: [u32; 2]) -> Self {
+        Self::Uint([val[0], val[1], 0, 1])
+    }
+}
+
+impl From<[u32; 3]> for ClearColorValue {
+    #[inline]
+    fn from(val: [u32; 3]) -> Self {
+        Self::Uint([val[0], val[1], val[2], 1])
+    }
+}
+
+impl From<[u32; 4]> for ClearColorValue {
+    #[inline]
+    fn from(val: [u32; 4]) -> Self {
+        Self::Uint(val)
+    }
+}
+
+/// A value that will be used to clear a depth/stencil image.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ClearDepthStencilValue {
+    /// Value for the depth component.
+    pub depth: f32,
+    /// Value for the stencil component.
+    pub stencil: u32,
+}
+
+impl From<ClearDepthStencilValue> for ash::vk::ClearDepthStencilValue {
+    #[inline]
+    fn from(val: ClearDepthStencilValue) -> Self {
+        Self {
+            depth: val.depth,
+            stencil: val.stencil,
+        }
+    }
+}
+
+impl From<f32> for ClearDepthStencilValue {
+    #[inline]
+    fn from(depth: f32) -> Self {
+        Self { depth, stencil: 0 }
+    }
+}
+
+impl From<u32> for ClearDepthStencilValue {
+    #[inline]
+    fn from(stencil: u32) -> Self {
+        Self {
+            depth: 0.0,
+            stencil,
+        }
+    }
+}
+
+impl From<(f32, u32)> for ClearDepthStencilValue {
+    #[inline]
+    fn from((depth, stencil): (f32, u32)) -> Self {
+        Self { depth, stencil }
+    }
+}
+
+/// The properties of a format that are supported by a physical device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FormatProperties {
     /// Features available for images with linear tiling.
     pub linear_tiling_features: FormatFeatures,
@@ -689,71 +717,265 @@ pub struct FormatProperties {
 
     /// Features available for buffers.
     pub buffer_features: FormatFeatures,
+
+    pub _ne: crate::NonExhaustive,
 }
 
-/// The features supported by images with a particular format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[allow(missing_docs)]
-pub struct FormatFeatures {
-    pub sampled_image: bool,
-    pub storage_image: bool,
-    pub storage_image_atomic: bool,
-    pub uniform_texel_buffer: bool,
-    pub storage_texel_buffer: bool,
-    pub storage_texel_buffer_atomic: bool,
-    pub vertex_buffer: bool,
-    pub color_attachment: bool,
-    pub color_attachment_blend: bool,
-    pub depth_stencil_attachment: bool,
-    pub blit_src: bool,
-    pub blit_dst: bool,
-    pub sampled_image_filter_linear: bool,
-    pub transfer_src: bool,
-    pub transfer_dst: bool,
-    pub midpoint_chroma_samples: bool,
-    pub sampled_image_ycbcr_conversion_linear_filter: bool,
-    pub sampled_image_ycbcr_conversion_separate_reconstruction_filter: bool,
-    pub sampled_image_ycbcr_conversion_chroma_reconstruction_explicit: bool,
-    pub sampled_image_ycbcr_conversion_chroma_reconstruction_explicit_forceable: bool,
-    pub disjoint: bool,
-    pub cosited_chroma_samples: bool,
-    pub sampled_image_filter_minmax: bool,
-    pub img_sampled_image_filter_cubic: bool,
-    pub khr_acceleration_structure_vertex_buffer: bool,
-    pub ext_fragment_density_map: bool,
+impl Default for FormatProperties {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            linear_tiling_features: Default::default(),
+            optimal_tiling_features: Default::default(),
+            buffer_features: Default::default(),
+            _ne: crate::NonExhaustive(()),
+        }
+    }
+}
+
+impl FormatProperties {
+    /// Returns the potential format features, following the definition of
+    /// <https://registry.khronos.org/vulkan/specs/1.3-extensions/html/chap43.html#potential-format-features>.
+    #[inline]
+    pub fn potential_format_features(&self) -> FormatFeatures {
+        self.linear_tiling_features | self.optimal_tiling_features
+    }
+}
+
+vulkan_bitflags! {
+    #[non_exhaustive]
+
+    /// The features supported by a device for an image or buffer with a particular format.
+    FormatFeatures = FormatFeatureFlags2(u64);
+
+    /* Image usage  */
+
+    /// Can be used with a sampled image descriptor.
+    SAMPLED_IMAGE = SAMPLED_IMAGE,
+
+    /// Can be used with a storage image descriptor.
+    STORAGE_IMAGE = STORAGE_IMAGE,
+
+    /// Can be used with a storage image descriptor with atomic operations in a shader.
+    STORAGE_IMAGE_ATOMIC = STORAGE_IMAGE_ATOMIC,
+
+    /// Can be used with a storage image descriptor for reading, without specifying a format on the
+    /// image view.
+    STORAGE_READ_WITHOUT_FORMAT = STORAGE_READ_WITHOUT_FORMAT {
+        api_version: V1_3,
+        device_extensions: [khr_format_feature_flags2],
+    },
+
+    /// Can be used with a storage image descriptor for writing, without specifying a format on the
+    /// image view.
+    STORAGE_WRITE_WITHOUT_FORMAT = STORAGE_WRITE_WITHOUT_FORMAT {
+        api_version: V1_3,
+        device_extensions: [khr_format_feature_flags2],
+    },
+
+    /// Can be used with a color attachment in a framebuffer, or with an input attachment
+    /// descriptor.
+    COLOR_ATTACHMENT = COLOR_ATTACHMENT,
+
+    /// Can be used with a color attachment in a framebuffer with blending, or with an input
+    /// attachment descriptor.
+    COLOR_ATTACHMENT_BLEND = COLOR_ATTACHMENT_BLEND,
+
+    /// Can be used with a depth/stencil attachment in a framebuffer, or with an input attachment
+    /// descriptor.
+    DEPTH_STENCIL_ATTACHMENT = DEPTH_STENCIL_ATTACHMENT,
+
+    /// Can be used with a fragment density map attachment in a framebuffer.
+    FRAGMENT_DENSITY_MAP = FRAGMENT_DENSITY_MAP_EXT {
+        device_extensions: [ext_fragment_density_map],
+    },
+
+    /// Can be used with a fragment shading rate attachment in a framebuffer.
+    FRAGMENT_SHADING_RATE_ATTACHMENT = FRAGMENT_SHADING_RATE_ATTACHMENT_KHR {
+        device_extensions: [khr_fragment_shading_rate],
+    },
+
+    /// Can be used with the source image in a transfer (copy) operation.
+    TRANSFER_SRC = TRANSFER_SRC {
+        api_version: V1_1,
+        device_extensions: [khr_maintenance1],
+    },
+
+    /// Can be used with the destination image in a transfer (copy) operation.
+    TRANSFER_DST = TRANSFER_DST {
+        api_version: V1_1,
+        device_extensions: [khr_maintenance1],
+    },
+
+    /// Can be used with the source image in a blit operation.
+    BLIT_SRC = BLIT_SRC,
+
+    /// Can be used with the destination image in a blit operation.
+    BLIT_DST = BLIT_DST,
+
+    /* Sampling  */
+
+    /// Can be used with samplers or as a blit source, using the
+    /// [`Linear`](crate::sampler::Filter::Linear) filter.
+    SAMPLED_IMAGE_FILTER_LINEAR = SAMPLED_IMAGE_FILTER_LINEAR,
+
+    /// Can be used with samplers or as a blit source, using the
+    /// [`Cubic`](crate::sampler::Filter::Cubic) filter.
+    SAMPLED_IMAGE_FILTER_CUBIC = SAMPLED_IMAGE_FILTER_CUBIC_EXT {
+        device_extensions: [ext_filter_cubic, img_filter_cubic],
+    },
+
+    /// Can be used with samplers using a reduction mode of
+    /// [`Min`](crate::sampler::SamplerReductionMode::Min) or
+    /// [`Max`](crate::sampler::SamplerReductionMode::Max).
+    SAMPLED_IMAGE_FILTER_MINMAX = SAMPLED_IMAGE_FILTER_MINMAX {
+        api_version: V1_2,
+        device_extensions: [ext_sampler_filter_minmax],
+    },
+
+    /// Can be used with sampler YCbCr conversions using a chroma offset of
+    /// [`Midpoint`](crate::sampler::ycbcr::ChromaLocation::Midpoint).
+    MIDPOINT_CHROMA_SAMPLES = MIDPOINT_CHROMA_SAMPLES {
+        api_version: V1_1,
+        device_extensions: [khr_sampler_ycbcr_conversion],
+    },
+
+    /// Can be used with sampler YCbCr conversions using a chroma offset of
+    /// [`CositedEven`](crate::sampler::ycbcr::ChromaLocation::CositedEven).
+    COSITED_CHROMA_SAMPLES = COSITED_CHROMA_SAMPLES {
+        api_version: V1_1,
+        device_extensions: [khr_sampler_ycbcr_conversion],
+    },
+
+    /// Can be used with sampler YCbCr conversions using the
+    /// [`Linear`](crate::sampler::Filter::Linear) chroma filter.
+    SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER = SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER {
+        api_version: V1_1,
+        device_extensions: [khr_sampler_ycbcr_conversion],
+    },
+
+    /// Can be used with sampler YCbCr conversions whose chroma filter differs from the filters of
+    /// the base sampler.
+    SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER = SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER {
+        api_version: V1_1,
+        device_extensions: [khr_sampler_ycbcr_conversion],
+    },
+
+    /// When used with a sampler YCbCr conversion, the implementation will always perform
+    /// explicit chroma reconstruction.
+    SAMPLED_IMAGE_YCBCR_CONVERSION_CHROMA_RECONSTRUCTION_EXPLICIT = SAMPLED_IMAGE_YCBCR_CONVERSION_CHROMA_RECONSTRUCTION_EXPLICIT {
+        api_version: V1_1,
+        device_extensions: [khr_sampler_ycbcr_conversion],
+    },
+
+    /// Can be used with sampler YCbCr conversions with forced explicit reconstruction.
+    SAMPLED_IMAGE_YCBCR_CONVERSION_CHROMA_RECONSTRUCTION_EXPLICIT_FORCEABLE = SAMPLED_IMAGE_YCBCR_CONVERSION_CHROMA_RECONSTRUCTION_EXPLICIT_FORCEABLE {
+        api_version: V1_1,
+        device_extensions: [khr_sampler_ycbcr_conversion],
+    },
+
+    /// Can be used with samplers using depth comparison.
+    SAMPLED_IMAGE_DEPTH_COMPARISON = SAMPLED_IMAGE_DEPTH_COMPARISON {
+        api_version: V1_3,
+        device_extensions: [khr_format_feature_flags2],
+    },
+
+    /* Video */
+
+    /// Can be used with the output image of a video decode operation.
+    VIDEO_DECODE_OUTPUT = VIDEO_DECODE_OUTPUT_KHR {
+        device_extensions: [khr_video_decode_queue],
+    },
+
+    /// Can be used with the DPB image of a video decode operation.
+    VIDEO_DECODE_DPB = VIDEO_DECODE_DPB_KHR {
+        device_extensions: [khr_video_decode_queue],
+    },
+
+    /// Can be used with the input image of a video encode operation.
+    VIDEO_ENCODE_INPUT = VIDEO_ENCODE_INPUT_KHR {
+        device_extensions: [khr_video_encode_queue],
+    },
+
+    /// Can be used with the DPB image of a video encode operation.
+    VIDEO_ENCODE_DPB = VIDEO_ENCODE_DPB_KHR {
+        device_extensions: [khr_video_encode_queue],
+    },
+
+    /* Misc image features */
+
+    /// For multi-planar formats, can be used with images created with the [`DISJOINT`] flag.
+    ///
+    /// [`DISJOINT`]: crate::image::ImageCreateFlags::DISJOINT
+    DISJOINT = DISJOINT {
+        api_version: V1_1,
+        device_extensions: [khr_sampler_ycbcr_conversion],
+    },
+
+    // TODO: document
+    LINEAR_COLOR_ATTACHMENT = LINEAR_COLOR_ATTACHMENT_NV {
+        device_extensions: [nv_linear_color_attachment],
+    },
+
+    // TODO: document
+    WEIGHT_IMAGE = WEIGHT_IMAGE_QCOM {
+        device_extensions: [qcom_image_processing],
+    },
+
+    // TODO: document
+    WEIGHT_SAMPLED_IMAGE = WEIGHT_SAMPLED_IMAGE_QCOM {
+        device_extensions: [qcom_image_processing],
+    },
+
+    // TODO: document
+    BLOCK_MATCHING = BLOCK_MATCHING_QCOM {
+        device_extensions: [qcom_image_processing],
+    },
+
+    // TODO: document
+    BOX_FILTER_SAMPLED = BOX_FILTER_SAMPLED_QCOM {
+        device_extensions: [qcom_image_processing],
+    },
+
+    // TODO: document
+    OPTICAL_FLOW_IMAGE = OPTICAL_FLOW_IMAGE_NV {
+        device_extensions: [nv_optical_flow],
+    },
+
+    // TODO: document
+    OPTICAL_FLOW_VECTOR = OPTICAL_FLOW_VECTOR_NV {
+        device_extensions: [nv_optical_flow],
+    },
+
+    // TODO: document
+    OPTICAL_FLOW_COST = OPTICAL_FLOW_COST_NV {
+        device_extensions: [nv_optical_flow],
+    },
+
+    /* Buffer usage  */
+
+    /// Can be used with a uniform texel buffer descriptor.
+    UNIFORM_TEXEL_BUFFER = UNIFORM_TEXEL_BUFFER,
+
+    /// Can be used with a storage texel buffer descriptor.
+    STORAGE_TEXEL_BUFFER = STORAGE_TEXEL_BUFFER,
+
+    /// Can be used with a storage texel buffer descriptor with atomic operations in a shader.
+    STORAGE_TEXEL_BUFFER_ATOMIC = STORAGE_TEXEL_BUFFER_ATOMIC,
+
+    /// Can be used as the format of a vertex attribute in the vertex input state of a graphics
+    /// pipeline.
+    VERTEX_BUFFER = VERTEX_BUFFER,
+
+    /// Can be used with the vertex buffer of an acceleration structure.
+    ACCELERATION_STRUCTURE_VERTEX_BUFFER = ACCELERATION_STRUCTURE_VERTEX_BUFFER_KHR {
+        device_extensions: [khr_acceleration_structure],
+    },
 }
 
 impl From<ash::vk::FormatFeatureFlags> for FormatFeatures {
     #[inline]
-    #[rustfmt::skip]
-    fn from(val: ash::vk::FormatFeatureFlags) -> FormatFeatures {
-        FormatFeatures {
-            sampled_image: !(val & ash::vk::FormatFeatureFlags::SAMPLED_IMAGE).is_empty(),
-            storage_image: !(val & ash::vk::FormatFeatureFlags::STORAGE_IMAGE).is_empty(),
-            storage_image_atomic: !(val & ash::vk::FormatFeatureFlags::STORAGE_IMAGE_ATOMIC).is_empty(),
-            uniform_texel_buffer: !(val & ash::vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER).is_empty(),
-            storage_texel_buffer: !(val & ash::vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER).is_empty(),
-            storage_texel_buffer_atomic: !(val & ash::vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER_ATOMIC).is_empty(),
-            vertex_buffer: !(val & ash::vk::FormatFeatureFlags::VERTEX_BUFFER).is_empty(),
-            color_attachment: !(val & ash::vk::FormatFeatureFlags::COLOR_ATTACHMENT).is_empty(),
-            color_attachment_blend: !(val & ash::vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND).is_empty(),
-            depth_stencil_attachment: !(val & ash::vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT).is_empty(),
-            blit_src: !(val & ash::vk::FormatFeatureFlags::BLIT_SRC).is_empty(),
-            blit_dst: !(val & ash::vk::FormatFeatureFlags::BLIT_DST).is_empty(),
-            sampled_image_filter_linear: !(val & ash::vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR).is_empty(),
-            transfer_src: !(val & ash::vk::FormatFeatureFlags::TRANSFER_SRC).is_empty(),
-            transfer_dst: !(val & ash::vk::FormatFeatureFlags::TRANSFER_DST).is_empty(),
-            midpoint_chroma_samples: !(val & ash::vk::FormatFeatureFlags::MIDPOINT_CHROMA_SAMPLES).is_empty(),
-            sampled_image_ycbcr_conversion_linear_filter: !(val & ash::vk::FormatFeatureFlags::SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER).is_empty(),
-            sampled_image_ycbcr_conversion_separate_reconstruction_filter: !(val & ash::vk::FormatFeatureFlags::SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER).is_empty(),
-            sampled_image_ycbcr_conversion_chroma_reconstruction_explicit: !(val & ash::vk::FormatFeatureFlags::SAMPLED_IMAGE_YCBCR_CONVERSION_CHROMA_RECONSTRUCTION_EXPLICIT).is_empty(),
-            sampled_image_ycbcr_conversion_chroma_reconstruction_explicit_forceable: !(val & ash::vk::FormatFeatureFlags::SAMPLED_IMAGE_YCBCR_CONVERSION_CHROMA_RECONSTRUCTION_EXPLICIT_FORCEABLE).is_empty(),
-            disjoint: !(val & ash::vk::FormatFeatureFlags::DISJOINT).is_empty(),
-            cosited_chroma_samples: !(val & ash::vk::FormatFeatureFlags::COSITED_CHROMA_SAMPLES).is_empty(),
-            sampled_image_filter_minmax: !(val & ash::vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_MINMAX).is_empty(),
-            img_sampled_image_filter_cubic: !(val & ash::vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_CUBIC_IMG).is_empty(),
-            khr_acceleration_structure_vertex_buffer: !(val & ash::vk::FormatFeatureFlags::ACCELERATION_STRUCTURE_VERTEX_BUFFER_KHR).is_empty(),
-            ext_fragment_density_map: !(val & ash::vk::FormatFeatureFlags::FRAGMENT_DENSITY_MAP_EXT).is_empty(),
-        }
+    fn from(val: ash::vk::FormatFeatureFlags) -> Self {
+        Self::from(ash::vk::FormatFeatureFlags2::from_raw(val.as_raw() as u64))
     }
 }
