@@ -7,39 +7,34 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use crate::device::Device;
-use crate::format::ClearValue;
-use crate::format::Format;
-use crate::format::FormatTy;
-use crate::image::sys::ImageCreationError;
-use crate::image::sys::UnsafeImage;
-use crate::image::traits::ImageAccess;
-use crate::image::traits::ImageClearValue;
-use crate::image::traits::ImageContent;
-use crate::image::ImageCreateFlags;
-use crate::image::ImageDescriptorLayouts;
-use crate::image::ImageDimensions;
-use crate::image::ImageInner;
-use crate::image::ImageLayout;
-use crate::image::ImageUsage;
-use crate::image::SampleCount;
-use crate::memory::pool::AllocFromRequirementsFilter;
-use crate::memory::pool::AllocLayout;
-use crate::memory::pool::MappingRequirement;
-use crate::memory::pool::MemoryPool;
-use crate::memory::pool::MemoryPoolAlloc;
-use crate::memory::pool::PotentialDedicatedAllocation;
-use crate::memory::pool::StdMemoryPoolAlloc;
-use crate::memory::DedicatedAlloc;
-use crate::sync::AccessError;
-use crate::sync::Sharing;
-use std::hash::Hash;
-use std::hash::Hasher;
-use std::iter::Empty;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use super::{
+    sys::{Image, ImageMemory, RawImage},
+    traits::ImageContent,
+    ImageAccess, ImageAspects, ImageDescriptorLayouts, ImageError, ImageInner, ImageLayout,
+    ImageUsage, SampleCount,
+};
+use crate::{
+    device::{Device, DeviceOwned},
+    format::Format,
+    image::{sys::ImageCreateInfo, ImageCreateFlags, ImageDimensions, ImageFormatInfo},
+    memory::{
+        allocator::{
+            AllocationCreateInfo, AllocationType, MemoryAllocatePreference, MemoryAllocator,
+            MemoryUsage,
+        },
+        is_aligned, DedicatedAllocation, DeviceMemoryError, ExternalMemoryHandleType,
+        ExternalMemoryHandleTypes,
+    },
+    DeviceSize,
+};
+use std::{
+    fs::File,
+    hash::{Hash, Hasher},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 /// ImageAccess whose purpose is to be used as a framebuffer attachment.
 ///
@@ -71,15 +66,8 @@ use std::sync::Arc;
 ///
 // TODO: forbid reading transient images outside render passes?
 #[derive(Debug)]
-pub struct AttachmentImage<A = PotentialDedicatedAllocation<StdMemoryPoolAlloc>> {
-    // Inner implementation.
-    image: UnsafeImage,
-
-    // Memory used to back the image.
-    memory: A,
-
-    // Format.
-    format: Format,
+pub struct AttachmentImage {
+    inner: Arc<Image>,
 
     // Layout to use when the image is used as a framebuffer attachment.
     // Must be either "depth-stencil optimal" or "color optimal".
@@ -87,10 +75,7 @@ pub struct AttachmentImage<A = PotentialDedicatedAllocation<StdMemoryPoolAlloc>>
 
     // If true, then the image is in the layout of `attachment_layout` (above). If false, then it
     // is still `Undefined`.
-    initialized: AtomicBool,
-
-    // Number of times this image is locked on the GPU side.
-    gpu_lock: AtomicUsize,
+    layout_initialized: AtomicBool,
 }
 
 impl AttachmentImage {
@@ -100,16 +85,16 @@ impl AttachmentImage {
     /// format as a framebuffer attachment.
     #[inline]
     pub fn new(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
         AttachmentImage::new_impl(
-            device,
+            allocator,
             dimensions,
             1,
             format,
-            ImageUsage::none(),
+            ImageUsage::empty(),
             SampleCount::Sample1,
         )
     }
@@ -119,17 +104,14 @@ impl AttachmentImage {
     /// > **Note**: This function is just a convenient shortcut for `with_usage`.
     #[inline]
     pub fn input_attachment(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        let base_usage = ImageUsage {
-            input_attachment: true,
-            ..ImageUsage::none()
-        };
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let base_usage = ImageUsage::INPUT_ATTACHMENT;
 
         AttachmentImage::new_impl(
-            device,
+            allocator,
             dimensions,
             1,
             format,
@@ -144,12 +126,19 @@ impl AttachmentImage {
     /// > want a regular image.
     #[inline]
     pub fn multisampled(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         samples: SampleCount,
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        AttachmentImage::new_impl(device, dimensions, 1, format, ImageUsage::none(), samples)
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        AttachmentImage::new_impl(
+            allocator,
+            dimensions,
+            1,
+            format,
+            ImageUsage::empty(),
+            samples,
+        )
     }
 
     /// Same as `multisampled`, but creates an image that can be used as an input attachment.
@@ -157,17 +146,14 @@ impl AttachmentImage {
     /// > **Note**: This function is just a convenient shortcut for `multisampled_with_usage`.
     #[inline]
     pub fn multisampled_input_attachment(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         samples: SampleCount,
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        let base_usage = ImageUsage {
-            input_attachment: true,
-            ..ImageUsage::none()
-        };
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let base_usage = ImageUsage::INPUT_ATTACHMENT;
 
-        AttachmentImage::new_impl(device, dimensions, 1, format, base_usage, samples)
+        AttachmentImage::new_impl(allocator, dimensions, 1, format, base_usage, samples)
     }
 
     /// Same as `new`, but lets you specify additional usages.
@@ -177,12 +163,19 @@ impl AttachmentImage {
     /// addition to these two.
     #[inline]
     pub fn with_usage(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         format: Format,
         usage: ImageUsage,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        AttachmentImage::new_impl(device, dimensions, 1, format, usage, SampleCount::Sample1)
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        AttachmentImage::new_impl(
+            allocator,
+            dimensions,
+            1,
+            format,
+            usage,
+            SampleCount::Sample1,
+        )
     }
 
     /// Same as `with_usage`, but creates a multisampled image.
@@ -191,13 +184,13 @@ impl AttachmentImage {
     /// > want a regular image.
     #[inline]
     pub fn multisampled_with_usage(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         samples: SampleCount,
         format: Format,
         usage: ImageUsage,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        AttachmentImage::new_impl(device, dimensions, 1, format, usage, samples)
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        AttachmentImage::new_impl(allocator, dimensions, 1, format, usage, samples)
     }
 
     /// Same as `multisampled_with_usage`, but creates an image with multiple layers.
@@ -206,14 +199,14 @@ impl AttachmentImage {
     /// > want a regular image.
     #[inline]
     pub fn multisampled_with_usage_with_layers(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         array_layers: u32,
         samples: SampleCount,
         format: Format,
         usage: ImageUsage,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        AttachmentImage::new_impl(device, dimensions, array_layers, format, usage, samples)
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        AttachmentImage::new_impl(allocator, dimensions, array_layers, format, usage, samples)
     }
 
     /// Same as `new`, except that the image can later be sampled.
@@ -221,17 +214,14 @@ impl AttachmentImage {
     /// > **Note**: This function is just a convenient shortcut for `with_usage`.
     #[inline]
     pub fn sampled(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        let base_usage = ImageUsage {
-            sampled: true,
-            ..ImageUsage::none()
-        };
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let base_usage = ImageUsage::SAMPLED;
 
         AttachmentImage::new_impl(
-            device,
+            allocator,
             dimensions,
             1,
             format,
@@ -245,18 +235,14 @@ impl AttachmentImage {
     /// > **Note**: This function is just a convenient shortcut for `with_usage`.
     #[inline]
     pub fn sampled_input_attachment(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        let base_usage = ImageUsage {
-            sampled: true,
-            input_attachment: true,
-            ..ImageUsage::none()
-        };
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let base_usage = ImageUsage::SAMPLED | ImageUsage::INPUT_ATTACHMENT;
 
         AttachmentImage::new_impl(
-            device,
+            allocator,
             dimensions,
             1,
             format,
@@ -273,17 +259,14 @@ impl AttachmentImage {
     /// > **Note**: This function is just a convenient shortcut for `multisampled_with_usage`.
     #[inline]
     pub fn sampled_multisampled(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         samples: SampleCount,
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        let base_usage = ImageUsage {
-            sampled: true,
-            ..ImageUsage::none()
-        };
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let base_usage = ImageUsage::SAMPLED;
 
-        AttachmentImage::new_impl(device, dimensions, 1, format, base_usage, samples)
+        AttachmentImage::new_impl(allocator, dimensions, 1, format, base_usage, samples)
     }
 
     /// Same as `sampled_multisampled`, but creates an image that can be used as an input
@@ -292,18 +275,14 @@ impl AttachmentImage {
     /// > **Note**: This function is just a convenient shortcut for `multisampled_with_usage`.
     #[inline]
     pub fn sampled_multisampled_input_attachment(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         samples: SampleCount,
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        let base_usage = ImageUsage {
-            sampled: true,
-            input_attachment: true,
-            ..ImageUsage::none()
-        };
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let base_usage = ImageUsage::SAMPLED | ImageUsage::INPUT_ATTACHMENT;
 
-        AttachmentImage::new_impl(device, dimensions, 1, format, base_usage, samples)
+        AttachmentImage::new_impl(allocator, dimensions, 1, format, base_usage, samples)
     }
 
     /// Same as `new`, except that the image will be transient.
@@ -314,17 +293,14 @@ impl AttachmentImage {
     /// > **Note**: This function is just a convenient shortcut for `with_usage`.
     #[inline]
     pub fn transient(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        let base_usage = ImageUsage {
-            transient_attachment: true,
-            ..ImageUsage::none()
-        };
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let base_usage = ImageUsage::TRANSIENT_ATTACHMENT;
 
         AttachmentImage::new_impl(
-            device,
+            allocator,
             dimensions,
             1,
             format,
@@ -338,18 +314,14 @@ impl AttachmentImage {
     /// > **Note**: This function is just a convenient shortcut for `with_usage`.
     #[inline]
     pub fn transient_input_attachment(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        let base_usage = ImageUsage {
-            transient_attachment: true,
-            input_attachment: true,
-            ..ImageUsage::none()
-        };
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let base_usage = ImageUsage::TRANSIENT_ATTACHMENT | ImageUsage::INPUT_ATTACHMENT;
 
         AttachmentImage::new_impl(
-            device,
+            allocator,
             dimensions,
             1,
             format,
@@ -366,17 +338,14 @@ impl AttachmentImage {
     /// > **Note**: This function is just a convenient shortcut for `multisampled_with_usage`.
     #[inline]
     pub fn transient_multisampled(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         samples: SampleCount,
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        let base_usage = ImageUsage {
-            transient_attachment: true,
-            ..ImageUsage::none()
-        };
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let base_usage = ImageUsage::TRANSIENT_ATTACHMENT;
 
-        AttachmentImage::new_impl(device, dimensions, 1, format, base_usage, samples)
+        AttachmentImage::new_impl(allocator, dimensions, 1, format, base_usage, samples)
     }
 
     /// Same as `transient_multisampled`, but creates an image that can be used as an input
@@ -385,116 +354,246 @@ impl AttachmentImage {
     /// > **Note**: This function is just a convenient shortcut for `multisampled_with_usage`.
     #[inline]
     pub fn transient_multisampled_input_attachment(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         samples: SampleCount,
         format: Format,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        let base_usage = ImageUsage {
-            transient_attachment: true,
-            input_attachment: true,
-            ..ImageUsage::none()
-        };
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let base_usage = ImageUsage::TRANSIENT_ATTACHMENT | ImageUsage::INPUT_ATTACHMENT;
 
-        AttachmentImage::new_impl(device, dimensions, 1, format, base_usage, samples)
+        AttachmentImage::new_impl(allocator, dimensions, 1, format, base_usage, samples)
     }
 
     // All constructors dispatch to this one.
     fn new_impl(
-        device: Arc<Device>,
+        allocator: &(impl MemoryAllocator + ?Sized),
         dimensions: [u32; 2],
         array_layers: u32,
         format: Format,
-        base_usage: ImageUsage,
+        mut usage: ImageUsage,
         samples: SampleCount,
-    ) -> Result<Arc<AttachmentImage>, ImageCreationError> {
-        // TODO: check dimensions against the max_framebuffer_width/height/layers limits
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let physical_device = allocator.device().physical_device();
+        let device_properties = physical_device.properties();
 
-        let is_depth = match format.ty() {
-            FormatTy::Depth => true,
-            FormatTy::DepthStencil => true,
-            FormatTy::Stencil => true,
-            FormatTy::Compressed => panic!(),
-            _ => false,
-        };
-
-        let usage = ImageUsage {
-            color_attachment: !is_depth,
-            depth_stencil_attachment: is_depth,
-            ..base_usage
-        };
-
-        let (image, mem_reqs) = unsafe {
-            let dims = ImageDimensions::Dim2d {
-                width: dimensions[0],
-                height: dimensions[1],
-                array_layers,
-            };
-
-            UnsafeImage::new(
-                device.clone(),
-                usage,
-                format,
-                ImageCreateFlags::none(),
-                dims,
-                samples,
-                1,
-                Sharing::Exclusive::<Empty<u32>>,
-                false,
-                false,
-            )?
-        };
-
-        let memory = MemoryPool::alloc_from_requirements(
-            &Device::standard_pool(&device),
-            &mem_reqs,
-            AllocLayout::Optimal,
-            MappingRequirement::DoNotMap,
-            DedicatedAlloc::Image(&image),
-            |t| {
-                if t.is_device_local() {
-                    AllocFromRequirementsFilter::Preferred
-                } else {
-                    AllocFromRequirementsFilter::Allowed
-                }
-            },
-        )?;
-        debug_assert!((memory.offset() % mem_reqs.alignment) == 0);
-        unsafe {
-            image.bind_memory(memory.memory(), memory.offset())?;
+        if dimensions[0] > device_properties.max_framebuffer_height {
+            panic!("AttachmentImage height exceeds physical device's max_framebuffer_height");
+        }
+        if dimensions[1] > device_properties.max_framebuffer_width {
+            panic!("AttachmentImage width exceeds physical device's max_framebuffer_width");
+        }
+        if array_layers > device_properties.max_framebuffer_layers {
+            panic!("AttachmentImage layer count exceeds physical device's max_framebuffer_layers");
         }
 
-        Ok(Arc::new(AttachmentImage {
-            image,
-            memory,
-            format,
-            attachment_layout: if is_depth {
-                ImageLayout::DepthStencilAttachmentOptimal
-            } else {
-                ImageLayout::ColorAttachmentOptimal
+        let aspects = format.aspects();
+        let is_depth_stencil = aspects.intersects(ImageAspects::DEPTH | ImageAspects::STENCIL);
+
+        if is_depth_stencil {
+            usage -= ImageUsage::COLOR_ATTACHMENT;
+            usage |= ImageUsage::DEPTH_STENCIL_ATTACHMENT;
+        } else {
+            usage |= ImageUsage::COLOR_ATTACHMENT;
+            usage -= ImageUsage::DEPTH_STENCIL_ATTACHMENT;
+        }
+
+        if format.compression().is_some() {
+            panic!() // TODO: message?
+        }
+
+        let raw_image = RawImage::new(
+            allocator.device().clone(),
+            ImageCreateInfo {
+                dimensions: ImageDimensions::Dim2d {
+                    width: dimensions[0],
+                    height: dimensions[1],
+                    array_layers,
+                },
+                format: Some(format),
+                samples,
+                usage,
+                ..Default::default()
             },
-            initialized: AtomicBool::new(false),
-            gpu_lock: AtomicUsize::new(0),
-        }))
+        )?;
+        let requirements = raw_image.memory_requirements()[0];
+        let res = unsafe {
+            allocator.allocate_unchecked(
+                requirements,
+                AllocationType::NonLinear,
+                AllocationCreateInfo {
+                    usage: MemoryUsage::DeviceOnly,
+                    allocate_preference: MemoryAllocatePreference::Unknown,
+                    _ne: crate::NonExhaustive(()),
+                },
+                Some(DedicatedAllocation::Image(&raw_image)),
+            )
+        };
+
+        match res {
+            Ok(alloc) => {
+                debug_assert!(is_aligned(alloc.offset(), requirements.layout.alignment()));
+                debug_assert!(alloc.size() == requirements.layout.size());
+
+                let inner = Arc::new(
+                    unsafe { raw_image.bind_memory_unchecked([alloc]) }
+                        .map_err(|(err, _, _)| err)?,
+                );
+
+                Ok(Arc::new(AttachmentImage {
+                    inner,
+                    attachment_layout: if is_depth_stencil {
+                        ImageLayout::DepthStencilAttachmentOptimal
+                    } else {
+                        ImageLayout::ColorAttachmentOptimal
+                    },
+                    layout_initialized: AtomicBool::new(false),
+                }))
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub fn new_with_exportable_fd(
+        allocator: &(impl MemoryAllocator + ?Sized),
+        dimensions: [u32; 2],
+        array_layers: u32,
+        format: Format,
+        mut usage: ImageUsage,
+        samples: SampleCount,
+    ) -> Result<Arc<AttachmentImage>, ImageError> {
+        let physical_device = allocator.device().physical_device();
+        let device_properties = physical_device.properties();
+
+        if dimensions[0] > device_properties.max_framebuffer_height {
+            panic!("AttachmentImage height exceeds physical device's max_framebuffer_height");
+        }
+        if dimensions[1] > device_properties.max_framebuffer_width {
+            panic!("AttachmentImage width exceeds physical device's max_framebuffer_width");
+        }
+        if array_layers > device_properties.max_framebuffer_layers {
+            panic!("AttachmentImage layer count exceeds physical device's max_framebuffer_layers");
+        }
+
+        let aspects = format.aspects();
+        let is_depth_stencil = aspects.intersects(ImageAspects::DEPTH | ImageAspects::STENCIL);
+
+        if is_depth_stencil {
+            usage -= ImageUsage::COLOR_ATTACHMENT;
+            usage |= ImageUsage::DEPTH_STENCIL_ATTACHMENT;
+        } else {
+            usage |= ImageUsage::COLOR_ATTACHMENT;
+            usage -= ImageUsage::DEPTH_STENCIL_ATTACHMENT;
+        }
+
+        let external_memory_properties = allocator
+            .device()
+            .physical_device()
+            .image_format_properties(ImageFormatInfo {
+                flags: ImageCreateFlags::MUTABLE_FORMAT,
+                format: Some(format),
+                usage,
+                external_memory_handle_type: Some(ExternalMemoryHandleType::OpaqueFd),
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap()
+            .external_memory_properties;
+        // VUID-VkExportMemoryAllocateInfo-handleTypes-00656
+        assert!(external_memory_properties.exportable);
+
+        // VUID-VkMemoryAllocateInfo-pNext-00639
+        // Guaranteed because we always create a dedicated allocation
+
+        let external_memory_handle_types = ExternalMemoryHandleTypes::OPAQUE_FD;
+        let raw_image = RawImage::new(
+            allocator.device().clone(),
+            ImageCreateInfo {
+                flags: ImageCreateFlags::MUTABLE_FORMAT,
+                dimensions: ImageDimensions::Dim2d {
+                    width: dimensions[0],
+                    height: dimensions[1],
+                    array_layers,
+                },
+                format: Some(format),
+                samples,
+                usage,
+                external_memory_handle_types,
+                ..Default::default()
+            },
+        )?;
+        let requirements = raw_image.memory_requirements()[0];
+        let memory_type_index = allocator
+            .find_memory_type_index(
+                requirements.memory_type_bits,
+                MemoryUsage::DeviceOnly.into(),
+            )
+            .expect("failed to find a suitable memory type");
+
+        match unsafe {
+            allocator.allocate_dedicated_unchecked(
+                memory_type_index,
+                requirements.layout.size(),
+                Some(DedicatedAllocation::Image(&raw_image)),
+                external_memory_handle_types,
+            )
+        } {
+            Ok(alloc) => {
+                debug_assert!(is_aligned(alloc.offset(), requirements.layout.alignment()));
+                debug_assert!(alloc.size() == requirements.layout.size());
+
+                let inner = Arc::new(unsafe {
+                    raw_image
+                        .bind_memory_unchecked([alloc])
+                        .map_err(|(err, _, _)| err)?
+                });
+
+                Ok(Arc::new(AttachmentImage {
+                    inner,
+                    attachment_layout: if is_depth_stencil {
+                        ImageLayout::DepthStencilAttachmentOptimal
+                    } else {
+                        ImageLayout::ColorAttachmentOptimal
+                    },
+                    layout_initialized: AtomicBool::new(false),
+                }))
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Exports posix file descriptor for the allocated memory.
+    /// Requires `khr_external_memory_fd` and `khr_external_memory` extensions to be loaded.
+    #[inline]
+    pub fn export_posix_fd(&self) -> Result<File, DeviceMemoryError> {
+        let allocation = match self.inner.memory() {
+            ImageMemory::Normal(a) => &a[0],
+            _ => unreachable!(),
+        };
+
+        allocation
+            .device_memory()
+            .export_fd(ExternalMemoryHandleType::OpaqueFd)
+    }
+
+    /// Return the size of the allocated memory (used e.g. with cuda).
+    #[inline]
+    pub fn mem_size(&self) -> DeviceSize {
+        let allocation = match self.inner.memory() {
+            ImageMemory::Normal(a) => &a[0],
+            _ => unreachable!(),
+        };
+
+        allocation.device_memory().allocation_size()
     }
 }
 
-impl<A> AttachmentImage<A> {
-    /// Returns the dimensions of the image.
+unsafe impl ImageAccess for AttachmentImage {
     #[inline]
-    pub fn dimensions(&self) -> [u32; 2] {
-        let dims = self.image.dimensions();
-        [dims.width(), dims.height()]
-    }
-}
-
-unsafe impl<A> ImageAccess for AttachmentImage<A> {
-    #[inline]
-    fn inner(&self) -> ImageInner {
+    fn inner(&self) -> ImageInner<'_> {
         ImageInner {
-            image: &self.image,
+            image: &self.inner,
             first_layer: 0,
-            num_layers: self.image.dimensions().array_layers() as usize,
+            num_layers: self.inner.dimensions().array_layers(),
             first_mipmap_level: 0,
             num_mipmap_levels: 1,
         }
@@ -513,7 +612,7 @@ unsafe impl<A> ImageAccess for AttachmentImage<A> {
     #[inline]
     fn descriptor_layouts(&self) -> Option<ImageDescriptorLayouts> {
         Some(ImageDescriptorLayouts {
-            storage_image: ImageLayout::ShaderReadOnlyOptimal,
+            storage_image: ImageLayout::General,
             combined_image_sampler: ImageLayout::ShaderReadOnlyOptimal,
             sampled_image: ImageLayout::ShaderReadOnlyOptimal,
             input_attachment: ImageLayout::ShaderReadOnlyOptimal,
@@ -521,139 +620,69 @@ unsafe impl<A> ImageAccess for AttachmentImage<A> {
     }
 
     #[inline]
-    fn conflict_key(&self) -> u64 {
-        self.image.key()
-    }
-
-    #[inline]
-    fn try_gpu_lock(
-        &self,
-        _: bool,
-        uninitialized_safe: bool,
-        expected_layout: ImageLayout,
-    ) -> Result<(), AccessError> {
-        if expected_layout != self.attachment_layout && expected_layout != ImageLayout::Undefined {
-            if self.initialized.load(Ordering::SeqCst) {
-                return Err(AccessError::UnexpectedImageLayout {
-                    requested: expected_layout,
-                    allowed: self.attachment_layout,
-                });
-            } else {
-                return Err(AccessError::UnexpectedImageLayout {
-                    requested: expected_layout,
-                    allowed: ImageLayout::Undefined,
-                });
-            }
-        }
-
-        if !uninitialized_safe && expected_layout != ImageLayout::Undefined {
-            if !self.initialized.load(Ordering::SeqCst) {
-                return Err(AccessError::ImageNotInitialized {
-                    requested: expected_layout,
-                });
-            }
-        }
-
-        if self
-            .gpu_lock
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-            .unwrap_or_else(|e| e)
-            == 0
-        {
-            Ok(())
-        } else {
-            Err(AccessError::AlreadyInUse)
-        }
-    }
-
-    #[inline]
-    unsafe fn increase_gpu_lock(&self) {
-        let val = self.gpu_lock.fetch_add(1, Ordering::SeqCst);
-        debug_assert!(val >= 1);
-    }
-
-    #[inline]
-    unsafe fn unlock(&self, new_layout: Option<ImageLayout>) {
-        if let Some(new_layout) = new_layout {
-            debug_assert_eq!(new_layout, self.attachment_layout);
-            self.initialized.store(true, Ordering::SeqCst);
-        }
-
-        let prev_val = self.gpu_lock.fetch_sub(1, Ordering::SeqCst);
-        debug_assert!(prev_val >= 1);
-    }
-
-    #[inline]
     unsafe fn layout_initialized(&self) {
-        self.initialized.store(true, Ordering::SeqCst);
+        self.layout_initialized.store(true, Ordering::SeqCst);
     }
 
     #[inline]
     fn is_layout_initialized(&self) -> bool {
-        self.initialized.load(Ordering::SeqCst)
-    }
-
-    #[inline]
-    fn current_miplevels_access(&self) -> std::ops::Range<u32> {
-        0..self.mipmap_levels()
-    }
-
-    #[inline]
-    fn current_layer_levels_access(&self) -> std::ops::Range<u32> {
-        0..1
+        self.layout_initialized.load(Ordering::SeqCst)
     }
 }
 
-unsafe impl<A> ImageClearValue<ClearValue> for Arc<AttachmentImage<A>> {
+unsafe impl DeviceOwned for AttachmentImage {
     #[inline]
-    fn decode(&self, value: ClearValue) -> Option<ClearValue> {
-        Some(self.format.decode_clear_value(value))
+    fn device(&self) -> &Arc<Device> {
+        self.inner.device()
     }
 }
 
-unsafe impl<P, A> ImageContent<P> for Arc<AttachmentImage<A>> {
-    #[inline]
+unsafe impl<P> ImageContent<P> for AttachmentImage {
     fn matches_format(&self) -> bool {
         true // FIXME:
     }
 }
 
-impl<A> PartialEq for AttachmentImage<A> {
+impl PartialEq for AttachmentImage {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        ImageAccess::inner(self) == ImageAccess::inner(other)
+        self.inner() == other.inner()
     }
 }
 
-impl<A> Eq for AttachmentImage<A> {}
+impl Eq for AttachmentImage {}
 
-impl<A> Hash for AttachmentImage<A> {
-    #[inline]
+impl Hash for AttachmentImage {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        ImageAccess::inner(self).hash(state);
+        self.inner().hash(state);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::AttachmentImage;
-    use crate::format::Format;
+    use super::*;
+    use crate::memory::allocator::StandardMemoryAllocator;
 
     #[test]
     fn create_regular() {
         let (device, _) = gfx_dev_and_queue!();
-        let _img = AttachmentImage::new(device, [32, 32], Format::R8G8B8A8Unorm).unwrap();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
+        let _img =
+            AttachmentImage::new(&memory_allocator, [32, 32], Format::R8G8B8A8_UNORM).unwrap();
     }
 
     #[test]
     fn create_transient() {
         let (device, _) = gfx_dev_and_queue!();
-        let _img = AttachmentImage::transient(device, [32, 32], Format::R8G8B8A8Unorm).unwrap();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
+        let _img = AttachmentImage::transient(&memory_allocator, [32, 32], Format::R8G8B8A8_UNORM)
+            .unwrap();
     }
 
     #[test]
     fn d16_unorm_always_supported() {
         let (device, _) = gfx_dev_and_queue!();
-        let _img = AttachmentImage::new(device, [32, 32], Format::D16Unorm).unwrap();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
+        let _img = AttachmentImage::new(&memory_allocator, [32, 32], Format::D16_UNORM).unwrap();
     }
 }

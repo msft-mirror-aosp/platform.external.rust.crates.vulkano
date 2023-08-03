@@ -7,225 +7,143 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use std::ops::BitOr;
+use crate::macros::vulkan_bitflags;
 
-/// Describes how a buffer is going to be used. This is **not** just an optimization.
-///
-/// If you try to use a buffer in a way that you didn't declare, a panic will happen.
-///
-/// Some methods are provided to build `BufferUsage` structs for some common situations. However
-/// there is no restriction in the combination of BufferUsages that can be enabled.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct BufferUsage {
-    pub transfer_source: bool,
-    pub transfer_destination: bool,
-    pub uniform_texel_buffer: bool,
-    pub storage_texel_buffer: bool,
-    pub uniform_buffer: bool,
-    pub storage_buffer: bool,
-    pub index_buffer: bool,
-    pub vertex_buffer: bool,
-    pub indirect_buffer: bool,
-    /// Requires the `buffer_device_address` feature. If that feature is not enabled, this will
-    /// be silently ignored.
-    pub device_address: bool,
-}
+vulkan_bitflags! {
+    #[non_exhaustive]
 
-impl BufferUsage {
-    /// Builds a `BufferUsage` with all values set to false.
-    #[inline]
-    pub const fn none() -> BufferUsage {
-        BufferUsage {
-            transfer_source: false,
-            transfer_destination: false,
-            uniform_texel_buffer: false,
-            storage_texel_buffer: false,
-            uniform_buffer: false,
-            storage_buffer: false,
-            index_buffer: false,
-            vertex_buffer: false,
-            indirect_buffer: false,
-            device_address: false,
-        }
-    }
+    /// Describes how a buffer is going to be used. This is **not** just an optimization.
+    ///
+    /// If you try to use a buffer in a way that you didn't declare, an error will be returned.
+    BufferUsage = BufferUsageFlags(u32);
 
-    /// Builds a `BufferUsage` with all values set to true. Can be used for quick prototyping.
-    #[inline]
-    pub const fn all() -> BufferUsage {
-        BufferUsage {
-            transfer_source: true,
-            transfer_destination: true,
-            uniform_texel_buffer: true,
-            storage_texel_buffer: true,
-            uniform_buffer: true,
-            storage_buffer: true,
-            index_buffer: true,
-            vertex_buffer: true,
-            indirect_buffer: true,
-            device_address: true,
-        }
-    }
+    /// The buffer can be used as a source for transfer, blit, resolve and clear commands.
+    TRANSFER_SRC = TRANSFER_SRC,
 
-    /// Builds a `BufferUsage` with `transfer_source` set to true and the rest to false.
-    #[inline]
-    pub const fn transfer_source() -> BufferUsage {
-        BufferUsage {
-            transfer_source: true,
-            ..BufferUsage::none()
-        }
-    }
+    /// The buffer can be used as a destination for transfer, blit, resolve and clear commands.
+    TRANSFER_DST = TRANSFER_DST,
 
-    /// Builds a `BufferUsage` with `transfer_destination` set to true and the rest to false.
-    #[inline]
-    pub const fn transfer_destination() -> BufferUsage {
-        BufferUsage {
-            transfer_destination: true,
-            ..BufferUsage::none()
-        }
-    }
+    /// The buffer can be used as a uniform texel buffer in a descriptor set.
+    UNIFORM_TEXEL_BUFFER = UNIFORM_TEXEL_BUFFER,
 
-    /// Builds a `BufferUsage` with `vertex_buffer` set to true and the rest to false.
-    #[inline]
-    pub const fn vertex_buffer() -> BufferUsage {
-        BufferUsage {
-            vertex_buffer: true,
-            ..BufferUsage::none()
-        }
-    }
+    /// The buffer can be used as a storage texel buffer in a descriptor set.
+    STORAGE_TEXEL_BUFFER = STORAGE_TEXEL_BUFFER,
 
-    /// Builds a `BufferUsage` with `vertex_buffer` and `transfer_destination` set to true and the rest
-    /// to false.
-    #[inline]
-    pub const fn vertex_buffer_transfer_destination() -> BufferUsage {
-        BufferUsage {
-            vertex_buffer: true,
-            transfer_destination: true,
-            ..BufferUsage::none()
-        }
-    }
+    /// The buffer can be used as a uniform buffer in a descriptor set.
+    UNIFORM_BUFFER = UNIFORM_BUFFER,
 
-    /// Builds a `BufferUsage` with `index_buffer` set to true and the rest to false.
-    #[inline]
-    pub const fn index_buffer() -> BufferUsage {
-        BufferUsage {
-            index_buffer: true,
-            ..BufferUsage::none()
-        }
-    }
+    /// The buffer can be used as a storage buffer in a descriptor set.
+    STORAGE_BUFFER = STORAGE_BUFFER,
 
-    /// Builds a `BufferUsage` with `index_buffer` and `transfer_destination` set to true and the rest to false.
-    #[inline]
-    pub const fn index_buffer_transfer_destination() -> BufferUsage {
-        BufferUsage {
-            index_buffer: true,
-            transfer_destination: true,
-            ..BufferUsage::none()
-        }
-    }
+    /// The buffer can be used as an index buffer.
+    INDEX_BUFFER = INDEX_BUFFER,
 
-    /// Builds a `BufferUsage` with `uniform_buffer` set to true and the rest to false.
-    #[inline]
-    pub const fn uniform_buffer() -> BufferUsage {
-        BufferUsage {
-            uniform_buffer: true,
-            ..BufferUsage::none()
-        }
-    }
+    /// The buffer can be used as a vertex or instance buffer.
+    VERTEX_BUFFER = VERTEX_BUFFER,
 
-    /// Builds a `BufferUsage` with `uniform_buffer` and `transfer_destination` set to true and the rest
-    /// to false.
-    #[inline]
-    pub const fn uniform_buffer_transfer_destination() -> BufferUsage {
-        BufferUsage {
-            uniform_buffer: true,
-            transfer_destination: true,
-            ..BufferUsage::none()
-        }
-    }
+    /// The buffer can be used as an indirect buffer.
+    INDIRECT_BUFFER = INDIRECT_BUFFER,
 
-    /// Builds a `BufferUsage` with `indirect_buffer` set to true and the rest to false.
-    #[inline]
-    pub const fn indirect_buffer() -> BufferUsage {
-        BufferUsage {
-            indirect_buffer: true,
-            ..BufferUsage::none()
-        }
-    }
+    /// The buffer's device address can be retrieved.
+    ///
+    /// A buffer created with this usage can only be bound to device memory allocated with the
+    /// [`MemoryAllocateFlags::DEVICE_ADDRESS`] flag, unless the [`ext_buffer_device_address`]
+    /// extension is enabled on the device.
+    ///
+    /// [`MemoryAllocateFlags::DEVICE_ADDRESS`]: crate::memory::MemoryAllocateFlags::DEVICE_ADDRESS
+    /// [`ext_buffer_device_address`]: crate::device::DeviceExtensions::ext_buffer_device_address
+    SHADER_DEVICE_ADDRESS = SHADER_DEVICE_ADDRESS {
+        api_version: V1_2,
+        device_extensions: [khr_buffer_device_address, ext_buffer_device_address],
+    },
 
-    /// Builds a `BufferUsage` with `indirect_buffer` and `transfer_destination` set to true and the rest
-    /// to false.
-    #[inline]
-    pub const fn indirect_buffer_transfer_destination() -> BufferUsage {
-        BufferUsage {
-            indirect_buffer: true,
-            transfer_destination: true,
-            ..BufferUsage::none()
-        }
-    }
+    /* TODO: enable
+    // TODO: document
+    VIDEO_DECODE_SRC = VIDEO_DECODE_SRC_KHR {
+        device_extensions: [khr_video_decode_queue],
+    },*/
 
-    /// Builds a `BufferUsage` with `device_address` set to true and the rest to false.
-    #[inline]
-    pub const fn device_address() -> BufferUsage {
-        BufferUsage {
-            device_address: true,
-            ..BufferUsage::none()
-        }
-    }
-}
+    /* TODO: enable
+    // TODO: document
+    VIDEO_DECODE_DST = VIDEO_DECODE_DST_KHR {
+        device_extensions: [khr_video_decode_queue],
+    },*/
 
-impl From<BufferUsage> for ash::vk::BufferUsageFlags {
-    fn from(val: BufferUsage) -> Self {
-        let mut result = ash::vk::BufferUsageFlags::empty();
-        if val.transfer_source {
-            result |= ash::vk::BufferUsageFlags::TRANSFER_SRC;
-        }
-        if val.transfer_destination {
-            result |= ash::vk::BufferUsageFlags::TRANSFER_DST;
-        }
-        if val.uniform_texel_buffer {
-            result |= ash::vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER;
-        }
-        if val.storage_texel_buffer {
-            result |= ash::vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER;
-        }
-        if val.uniform_buffer {
-            result |= ash::vk::BufferUsageFlags::UNIFORM_BUFFER;
-        }
-        if val.storage_buffer {
-            result |= ash::vk::BufferUsageFlags::STORAGE_BUFFER;
-        }
-        if val.index_buffer {
-            result |= ash::vk::BufferUsageFlags::INDEX_BUFFER;
-        }
-        if val.vertex_buffer {
-            result |= ash::vk::BufferUsageFlags::VERTEX_BUFFER;
-        }
-        if val.indirect_buffer {
-            result |= ash::vk::BufferUsageFlags::INDIRECT_BUFFER;
-        }
-        if val.device_address {
-            result |= ash::vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
-        }
-        result
-    }
-}
+    /* TODO: enable
+    // TODO: document
+    TRANSFORM_FEEDBACK_BUFFER = TRANSFORM_FEEDBACK_BUFFER_EXT {
+        device_extensions: [ext_transform_feedback],
+    },*/
 
-impl BitOr for BufferUsage {
-    type Output = Self;
+    /* TODO: enable
+    // TODO: document
+    TRANSFORM_FEEDBACK_COUNTER_BUFFER = TRANSFORM_FEEDBACK_COUNTER_BUFFER_EXT {
+        device_extensions: [ext_transform_feedback],
+    },*/
 
-    #[inline]
-    fn bitor(self, rhs: Self) -> Self {
-        BufferUsage {
-            transfer_source: self.transfer_source || rhs.transfer_source,
-            transfer_destination: self.transfer_destination || rhs.transfer_destination,
-            uniform_texel_buffer: self.uniform_texel_buffer || rhs.uniform_texel_buffer,
-            storage_texel_buffer: self.storage_texel_buffer || rhs.storage_texel_buffer,
-            uniform_buffer: self.uniform_buffer || rhs.uniform_buffer,
-            storage_buffer: self.storage_buffer || rhs.storage_buffer,
-            index_buffer: self.index_buffer || rhs.index_buffer,
-            vertex_buffer: self.vertex_buffer || rhs.vertex_buffer,
-            indirect_buffer: self.indirect_buffer || rhs.indirect_buffer,
-            device_address: self.device_address || rhs.device_address,
-        }
-    }
+    /* TODO: enable
+    // TODO: document
+    CONDITIONAL_RENDERING = CONDITIONAL_RENDERING_EXT {
+        device_extensions: [ext_conditional_rendering],
+    },*/
+
+    /* TODO: enable
+    // TODO: document
+    ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR = ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR {
+        device_extensions: [khr_acceleration_structure],
+    },*/
+
+    /* TODO: enable
+    // TODO: document
+    ACCELERATION_STRUCTURE_STORAGE = ACCELERATION_STRUCTURE_STORAGE_KHR {
+        device_extensions: [khr_acceleration_structure],
+    },*/
+
+    /* TODO: enable
+    // TODO: document
+    SHADER_BINDING_TABLE = SHADER_BINDING_TABLE_KHR {
+        device_extensions: [khr_ray_tracing_pipeline, nv_ray_tracing],
+    },*/
+
+    /* TODO: enable
+    // TODO: document
+    VIDEO_ENCODE_DST = VIDEO_ENCODE_DST_KHR {
+        device_extensions: [khr_video_encode_queue],
+    },*/
+
+    /* TODO: enable
+    // TODO: document
+    VIDEO_ENCODE_SRC = VIDEO_ENCODE_SRC_KHR {
+        device_extensions: [khr_video_encode_queue],
+    },*/
+
+    /* TODO: enable
+    // TODO: document
+    SAMPLER_DESCRIPTOR_BUFFER = SAMPLER_DESCRIPTOR_BUFFER_EXT {
+        device_extensions: [ext_descriptor_buffer],
+    },*/
+
+    /* TODO: enable
+    // TODO: document
+    RESOURCE_DESCRIPTOR_BUFFER = RESOURCE_DESCRIPTOR_BUFFER_EXT {
+        device_extensions: [ext_descriptor_buffer],
+    },*/
+
+    /* TODO: enable
+    // TODO: document
+    PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER = PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_EXT {
+        device_extensions: [ext_descriptor_buffer],
+    },*/
+
+    /* TODO: enable
+    // TODO: document
+    MICROMAP_BUILD_INPUT_READ_ONLY = MICROMAP_BUILD_INPUT_READ_ONLY_EXT {
+        device_extensions: [ext_opacity_micromap],
+    },*/
+
+    /* TODO: enable
+    // TODO: document
+    MICROMAP_STORAGE = MICROMAP_STORAGE_EXT {
+        device_extensions: [ext_opacity_micromap],
+    },*/
 }

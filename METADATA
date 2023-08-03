@@ -1,3 +1,7 @@
+# This project was upgraded with external_updater.
+# Usage: tools/external_updater/updater.sh update rust/crates/vulkano
+# For more info, check https://cs.android.com/android/platform/superproject/+/main:tools/external_updater/README.md
+
 name: "vulkano"
 description: "Safe wrapper for the Vulkan graphics API"
 third_party {
@@ -7,14 +11,13 @@ third_party {
   }
   url {
     type: ARCHIVE
-    value: "https://static.crates.io/crates/vulkano/vulkano-0.25.0.crate"
+    value: "https://static.crates.io/crates/vulkano/vulkano-0.33.0.crate"
   }
-  version: "0.25.0"
-  # Dual-licensed, using the least restrictive per go/thirdpartylicenses#same.
+  version: "0.33.0"
   license_type: NOTICE
   last_upgrade_date {
-    year: 2021
+    year: 2023
     month: 8
-    day: 30
+    day: 2
   }
 }
