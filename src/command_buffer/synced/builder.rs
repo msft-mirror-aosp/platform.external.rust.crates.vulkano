@@ -7,50 +7,59 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-pub use self::commands::SyncCommandBufferBuilderBindDescriptorSets;
-pub use self::commands::SyncCommandBufferBuilderBindVertexBuffer;
-pub use self::commands::SyncCommandBufferBuilderExecuteCommands;
-use super::Command;
-use super::ResourceFinalState;
-use super::ResourceKey;
-use super::ResourceLocation;
-use super::SyncCommandBuffer;
-use crate::buffer::BufferAccess;
-use crate::command_buffer::pool::UnsafeCommandPoolAlloc;
-use crate::command_buffer::sys::UnsafeCommandBufferBuilder;
-use crate::command_buffer::sys::UnsafeCommandBufferBuilderPipelineBarrier;
-use crate::command_buffer::CommandBufferExecError;
-use crate::command_buffer::CommandBufferLevel;
-use crate::command_buffer::CommandBufferUsage;
-use crate::command_buffer::ImageUninitializedSafe;
-use crate::descriptor_set::DescriptorSet;
-use crate::device::Device;
-use crate::device::DeviceOwned;
-use crate::image::ImageLayout;
-use crate::pipeline::{ComputePipelineAbstract, GraphicsPipelineAbstract, PipelineBindPoint};
-use crate::render_pass::FramebufferAbstract;
-use crate::sync::AccessFlags;
-use crate::sync::PipelineMemoryAccess;
-use crate::sync::PipelineStages;
-use crate::OomError;
-use fnv::FnvHashMap;
-use std::borrow::Cow;
-use std::collections::hash_map::Entry;
-use std::error;
-use std::fmt;
-use std::sync::Arc;
-
-#[path = "commands.rs"]
-mod commands;
+use super::{Command, Resource, SyncCommandBuffer};
+pub use crate::command_buffer::commands::{
+    bind_push::{
+        SyncCommandBufferBuilderBindDescriptorSets, SyncCommandBufferBuilderBindVertexBuffer,
+    },
+    secondary::SyncCommandBufferBuilderExecuteCommands,
+};
+use crate::{
+    buffer::{Buffer, Subbuffer},
+    command_buffer::{
+        pool::CommandPoolAlloc,
+        sys::{CommandBufferBeginInfo, UnsafeCommandBufferBuilder},
+        CommandBufferBufferRangeUsage, CommandBufferBufferUsage, CommandBufferExecError,
+        CommandBufferImageRangeUsage, CommandBufferImageUsage, CommandBufferLevel,
+        CommandBufferResourcesUsage, ResourceUseRef, SecondaryCommandBufferBufferUsage,
+        SecondaryCommandBufferImageUsage, SecondaryCommandBufferResourcesUsage,
+    },
+    descriptor_set::{DescriptorSetResources, DescriptorSetWithOffsets},
+    device::{Device, DeviceOwned},
+    image::{sys::Image, ImageAccess, ImageAspects, ImageLayout, ImageSubresourceRange},
+    pipeline::{
+        graphics::{
+            color_blend::LogicOp,
+            depth_stencil::{CompareOp, StencilOps},
+            input_assembly::{IndexType, PrimitiveTopology},
+            rasterization::{CullMode, DepthBias, FrontFace, LineStipple},
+            viewport::{Scissor, Viewport},
+        },
+        ComputePipeline, DynamicState, GraphicsPipeline, PipelineBindPoint, PipelineLayout,
+    },
+    range_map::RangeMap,
+    range_set::RangeSet,
+    sync::{
+        AccessFlags, BufferMemoryBarrier, DependencyInfo, ImageMemoryBarrier, PipelineMemoryAccess,
+        PipelineStages,
+    },
+    DeviceSize, OomError, VulkanObject,
+};
+use ahash::HashMap;
+use smallvec::SmallVec;
+use std::{
+    collections::hash_map::Entry,
+    error::Error,
+    fmt::{Debug, Display, Error as FmtError, Formatter},
+    ops::{Range, RangeInclusive},
+    sync::Arc,
+};
 
 /// Wrapper around `UnsafeCommandBufferBuilder` that handles synchronization for you.
 ///
 /// Each method of the `UnsafeCommandBufferBuilder` has an equivalent in this wrapper, except
 /// for `pipeline_layout` which is automatically handled. This wrapper automatically builds
 /// pipeline barriers, keeps used resources alive and implements the `CommandBuffer` trait.
-///
-/// Since the implementation needs to cache commands in a `Vec`, most methods have additional
-/// `Send + Sync + 'static` trait requirements on their generics.
 ///
 /// If this builder finds out that a command isn't valid because of synchronization reasons (eg.
 /// trying to copy from a buffer to an image which share the same memory), then an error is
@@ -59,18 +68,16 @@ mod commands;
 /// the commands except for synchronization purposes. The builder may panic if you pass invalid
 /// commands.
 pub struct SyncCommandBufferBuilder {
-    // The actual Vulkan command buffer builder.
     inner: UnsafeCommandBufferBuilder,
+    level: CommandBufferLevel,
 
     // Stores all the commands that were added to the sync builder. Some of them are maybe not
     // submitted to the inner builder yet.
-    // Each command owns the resources it uses (buffers, images, pipelines, descriptor sets etc.),
-    // references to any of these must be indirect in the form of a command index + resource id.
-    commands: Vec<Arc<dyn Command + Send + Sync>>,
+    pub(in crate::command_buffer) commands: Vec<Box<dyn Command>>,
 
     // Prototype for the pipeline barrier that must be submitted before flushing the commands
     // in `commands`.
-    pending_barrier: UnsafeCommandBufferBuilderPipelineBarrier,
+    pending_barrier: DependencyInfo,
 
     // Locations within commands that pipeline barriers were inserted. For debugging purposes.
     // TODO: present only in cfg(debug_assertions)?
@@ -82,33 +89,17 @@ pub struct SyncCommandBufferBuilder {
 
     // If we're currently inside a render pass, contains the index of the `CmdBeginRenderPass`
     // command.
-    latest_render_pass_enter: Option<usize>,
+    pub(in crate::command_buffer) latest_render_pass_enter: Option<usize>,
 
     // Stores the current state of buffers and images that are in use by the command buffer.
-    resources: FnvHashMap<ResourceKey, ResourceState>,
+    buffers2: HashMap<Arc<Buffer>, RangeMap<DeviceSize, BufferState>>,
+    images2: HashMap<Arc<Image>, RangeMap<DeviceSize, ImageState>>,
 
     // Resources and their accesses. Used for executing secondary command buffers in a primary.
-    buffers: Vec<(ResourceLocation, PipelineMemoryAccess)>,
-    images: Vec<(
-        ResourceLocation,
-        PipelineMemoryAccess,
-        ImageLayout,
-        ImageLayout,
-        ImageUninitializedSafe,
-    )>,
+    secondary_resources_usage: SecondaryCommandBufferResourcesUsage,
 
-    // State of bindings.
-    bindings: BindingState,
-
-    // `true` if the builder has been put in an inconsistent state. This happens when
-    // `append_command` throws an error, because some changes to the internal state have already
-    // been made at that point and can't be reverted.
-    // TODO: throw the error in `append_command` _before_ any state changes are made,
-    // so that this is no longer needed.
-    is_poisoned: bool,
-
-    // True if we're a secondary command buffer.
-    is_secondary: bool,
+    // Current binding/setting state.
+    pub(in crate::command_buffer) current_state: CurrentState,
 }
 
 impl SyncCommandBufferBuilder {
@@ -118,25 +109,24 @@ impl SyncCommandBufferBuilder {
     /// # Safety
     ///
     /// See `UnsafeCommandBufferBuilder::new()`.
-    pub unsafe fn new<F>(
-        pool_alloc: &UnsafeCommandPoolAlloc,
-        level: CommandBufferLevel<F>,
-        usage: CommandBufferUsage,
-    ) -> Result<SyncCommandBufferBuilder, OomError>
-    where
-        F: FramebufferAbstract,
-    {
-        let (is_secondary, inside_render_pass) = match level {
-            CommandBufferLevel::Primary => (false, false),
-            CommandBufferLevel::Secondary(ref inheritance) => {
-                (true, inheritance.render_pass.is_some())
-            }
-        };
+    #[inline]
+    pub unsafe fn new(
+        pool_alloc: &CommandPoolAlloc,
+        begin_info: CommandBufferBeginInfo,
+    ) -> Result<SyncCommandBufferBuilder, OomError> {
+        let level = pool_alloc.level();
+        let inside_render_pass = level == CommandBufferLevel::Secondary
+            && begin_info
+                .inheritance_info
+                .as_ref()
+                .unwrap()
+                .render_pass
+                .is_some();
+        let inner = UnsafeCommandBufferBuilder::new(pool_alloc, begin_info)?;
 
-        let cmd = UnsafeCommandBufferBuilder::new(pool_alloc, level, usage)?;
         Ok(SyncCommandBufferBuilder::from_unsafe_cmd(
-            cmd,
-            is_secondary,
+            inner,
+            level,
             inside_render_pass,
         ))
     }
@@ -152,356 +142,90 @@ impl SyncCommandBufferBuilder {
     /// any existing resource usage.
     #[inline]
     pub unsafe fn from_unsafe_cmd(
-        cmd: UnsafeCommandBufferBuilder,
-        is_secondary: bool,
+        inner: UnsafeCommandBufferBuilder,
+        level: CommandBufferLevel,
         inside_render_pass: bool,
     ) -> SyncCommandBufferBuilder {
         let latest_render_pass_enter = if inside_render_pass { Some(0) } else { None };
 
         SyncCommandBufferBuilder {
-            inner: cmd,
+            inner,
+            level,
             commands: Vec::new(),
-            pending_barrier: UnsafeCommandBufferBuilderPipelineBarrier::new(),
+            pending_barrier: DependencyInfo::default(),
             barriers: Vec::new(),
             first_unflushed: 0,
             latest_render_pass_enter,
-            resources: FnvHashMap::default(),
-            buffers: Vec::new(),
-            images: Vec::new(),
-            bindings: Default::default(),
-            is_poisoned: false,
-            is_secondary,
+            buffers2: HashMap::default(),
+            images2: HashMap::default(),
+            secondary_resources_usage: Default::default(),
+            current_state: Default::default(),
         }
     }
 
-    // Adds a command to be processed by the builder.
-    //
-    // The `resources` argument should contain each buffer or image used by the command.
-    // The function will take care of handling the pipeline barrier or flushing.
-    //
-    // - The index of the resource within the `resources` slice maps to the resource accessed
-    //   through `Command::buffer(..)` or `Command::image(..)`.
-    // - `PipelineMemoryAccess` must match the way the resource has been used.
-    // - `start_layout` and `end_layout` designate the image layout that the image is expected to be
-    //   in when the command starts, and the image layout that the image will be transitioned to
-    //   during the command. When it comes to buffers, you should pass `Undefined` for both.
+    /// Returns the binding/setting state.
     #[inline]
-    fn append_command<C>(
-        &mut self,
-        command: C,
-        resources: &[(
-            KeyTy,
-            Option<(
-                PipelineMemoryAccess,
-                ImageLayout,
-                ImageLayout,
-                ImageUninitializedSafe,
-            )>,
-        )],
-    ) -> Result<(), SyncCommandBufferBuilderError>
-    where
-        C: Command + Send + Sync + 'static,
-    {
-        // TODO: see comment for the `is_poisoned` member in the struct
-        assert!(
-            !self.is_poisoned,
-            "The builder has been put in an inconsistent state by a previous error"
-        );
+    pub fn state(&self) -> CommandBufferBuilderState<'_> {
+        CommandBufferBuilderState {
+            current_state: &self.current_state,
+        }
+    }
 
-        // Note that we don't submit the command to the inner command buffer yet.
-        let (latest_command_id, end) = {
-            self.commands.push(Arc::new(command));
-            let latest_command_id = self.commands.len() - 1;
-            let end = self.latest_render_pass_enter.unwrap_or(latest_command_id);
-            (latest_command_id, end)
-        };
-        let mut last_cmd_buffer = 0;
-        let mut last_cmd_image = 0;
+    /// Resets the binding/setting state.
+    ///
+    /// This must be called after any command that changes the state in an undefined way, e.g.
+    /// executing a secondary command buffer.
+    #[inline]
+    pub fn reset_state(&mut self) {
+        self.current_state = Default::default();
+    }
 
-        for &(resource_ty, resource) in resources {
-            if let Some((memory, start_layout, end_layout, image_uninitialized_safe)) = resource {
-                // Anti-dumbness checks.
+    pub(in crate::command_buffer) fn check_resource_conflicts(
+        &self,
+        resource: &(ResourceUseRef, Resource),
+    ) -> Result<(), SyncCommandBufferBuilderError> {
+        let &(current_use_ref, ref resource) = resource;
+
+        match *resource {
+            Resource::Buffer {
+                ref buffer,
+                ref range,
+                ref memory,
+            } => {
+                debug_assert!(AccessFlags::from(memory.stages).contains(memory.access));
+
+                if let Some(previous_use_ref) =
+                    self.find_buffer_conflict(buffer, range.clone(), memory)
+                {
+                    return Err(SyncCommandBufferBuilderError::Conflict {
+                        current_use_ref,
+                        previous_use_ref,
+                    });
+                }
+            }
+            Resource::Image {
+                ref image,
+                ref subresource_range,
+                ref memory,
+                start_layout,
+                end_layout,
+            } => {
                 debug_assert!(memory.exclusive || start_layout == end_layout);
-                debug_assert!(memory.access.is_compatible_with(&memory.stages));
-                debug_assert!(resource_ty != KeyTy::Image || end_layout != ImageLayout::Undefined);
-                debug_assert!(
-                    resource_ty != KeyTy::Buffer || start_layout == ImageLayout::Undefined
-                );
-                debug_assert!(resource_ty != KeyTy::Buffer || end_layout == ImageLayout::Undefined);
-                debug_assert_ne!(end_layout, ImageLayout::Preinitialized);
+                debug_assert!(AccessFlags::from(memory.stages).contains(memory.access));
+                debug_assert!(end_layout != ImageLayout::Undefined);
+                debug_assert!(end_layout != ImageLayout::Preinitialized);
 
-                let (resource_key, resource_index) = match resource_ty {
-                    KeyTy::Buffer => {
-                        let buffer = self.commands[latest_command_id].buffer(last_cmd_buffer);
-                        (ResourceKey::from(buffer), last_cmd_buffer)
-                    }
-                    KeyTy::Image => {
-                        let image = self.commands[latest_command_id].image(last_cmd_image);
-                        (ResourceKey::from(image), last_cmd_image)
-                    }
-                };
-
-                match self.resources.entry(resource_key) {
-                    // Situation where this resource was used before in this command buffer.
-                    Entry::Occupied(mut entry) => {
-                        // `collision_cmd_ids` contains the IDs of the commands that we are potentially
-                        // colliding with.
-                        let collision_cmd_ids = &entry.get().command_ids;
-                        debug_assert!(collision_cmd_ids.iter().all(|id| *id <= latest_command_id));
-
-                        let entry_key_resource_index = entry.get().resource_index;
-
-                        // Find out if we have a collision with the pending commands.
-                        if memory.exclusive
-                            || entry.get().memory.exclusive
-                            || entry.get().current_layout != start_layout
-                        {
-                            // Collision found between `latest_command_id` and `collision_cmd_id`.
-
-                            // We now want to modify the current pipeline barrier in order to handle the
-                            // collision. But since the pipeline barrier is going to be submitted before
-                            // the flushed commands, it would be a mistake if `collision_cmd_id` hasn't
-                            // been flushed yet.
-                            let first_unflushed_cmd_id = self.first_unflushed;
-
-                            if collision_cmd_ids
-                                .iter()
-                                .any(|command_id| *command_id >= first_unflushed_cmd_id)
-                                || entry.get().current_layout != start_layout
-                            {
-                                unsafe {
-                                    // Flush the pending barrier.
-                                    self.inner.pipeline_barrier(&self.pending_barrier);
-                                    self.pending_barrier =
-                                        UnsafeCommandBufferBuilderPipelineBarrier::new();
-
-                                    // Flush the commands if possible, or return an error if not possible.
-                                    {
-                                        let start = self.first_unflushed;
-                                        self.barriers.push(start); // Track inserted barriers
-
-                                        if let Some(collision_cmd_id) = collision_cmd_ids
-                                            .iter()
-                                            .find(|command_id| **command_id >= end)
-                                        {
-                                            // TODO: see comment for the `is_poisoned` member in the struct
-                                            self.is_poisoned = true;
-
-                                            let cmd1 = &self.commands[*collision_cmd_id];
-                                            let cmd2 = &self.commands[latest_command_id];
-
-                                            return Err(SyncCommandBufferBuilderError::Conflict {
-                                                command1_name: cmd1.name(),
-                                                command1_param: match resource_ty {
-                                                    KeyTy::Buffer => {
-                                                        cmd1.buffer_name(entry_key_resource_index)
-                                                    }
-                                                    KeyTy::Image => {
-                                                        cmd1.image_name(entry_key_resource_index)
-                                                    }
-                                                },
-                                                command1_offset: *collision_cmd_id,
-
-                                                command2_name: cmd2.name(),
-                                                command2_param: match resource_ty {
-                                                    KeyTy::Buffer => {
-                                                        cmd2.buffer_name(resource_index)
-                                                    }
-                                                    KeyTy::Image => cmd2.image_name(resource_index),
-                                                },
-                                                command2_offset: latest_command_id,
-                                            });
-                                        }
-                                        for command in &mut self.commands[start..end] {
-                                            command.send(&mut self.inner);
-                                        }
-                                        self.first_unflushed = end;
-                                    }
-                                }
-                            }
-
-                            entry.get_mut().command_ids.push(latest_command_id);
-                            let entry = entry.into_mut();
-
-                            // Modify the pipeline barrier to handle the collision.
-                            unsafe {
-                                match resource_ty {
-                                    KeyTy::Buffer => {
-                                        let buf =
-                                            self.commands[latest_command_id].buffer(resource_index);
-
-                                        let b = &mut self.pending_barrier;
-                                        b.add_buffer_memory_barrier(
-                                            buf,
-                                            entry.memory.stages,
-                                            entry.memory.access,
-                                            memory.stages,
-                                            memory.access,
-                                            true,
-                                            None,
-                                            0,
-                                            buf.size(),
-                                        );
-                                    }
-
-                                    KeyTy::Image => {
-                                        let img =
-                                            self.commands[latest_command_id].image(resource_index);
-
-                                        let b = &mut self.pending_barrier;
-                                        b.add_image_memory_barrier(
-                                            img,
-                                            img.current_miplevels_access(),
-                                            img.current_layer_levels_access(),
-                                            entry.memory.stages,
-                                            entry.memory.access,
-                                            memory.stages,
-                                            memory.access,
-                                            true,
-                                            None,
-                                            entry.current_layout,
-                                            start_layout,
-                                        );
-                                    }
-                                };
-                            }
-
-                            // Update state.
-                            entry.memory = memory;
-                            entry.exclusive_any = true;
-                            if memory.exclusive || end_layout != ImageLayout::Undefined {
-                                // Only modify the layout in case of a write, because buffer operations
-                                // pass `Undefined` for the layout. While a buffer write *must* set the
-                                // layout to `Undefined`, a buffer read must not touch it.
-                                entry.current_layout = end_layout;
-                            }
-                        } else {
-                            // There is no collision. Simply merge the stages and accesses.
-                            // TODO: what about simplifying the newly-constructed stages/accesses?
-                            //       this would simplify the job of the driver, but is it worth it?
-                            let entry = entry.into_mut();
-                            entry.memory.stages |= memory.stages;
-                            entry.memory.access |= memory.access;
-                        }
-                    }
-
-                    // Situation where this is the first time we use this resource in this command buffer.
-                    Entry::Vacant(entry) => {
-                        // We need to perform some tweaks if the initial layout requirement of the image
-                        // is different from the first layout usage.
-                        let mut actually_exclusive = memory.exclusive;
-                        let mut actual_start_layout = start_layout;
-
-                        if !self.is_secondary
-                            && resource_ty == KeyTy::Image
-                            && start_layout != ImageLayout::Undefined
-                            && start_layout != ImageLayout::Preinitialized
-                        {
-                            let img = self.commands[latest_command_id].image(resource_index);
-                            let initial_layout_requirement = img.initial_layout_requirement();
-
-                            // Checks if the image is initialized and transitions it
-                            // if it isn't
-                            let is_layout_initialized = img.is_layout_initialized();
-
-                            if initial_layout_requirement != start_layout || !is_layout_initialized
-                            {
-                                // Note that we transition from `bottom_of_pipe`, which means that we
-                                // wait for all the previous commands to be entirely finished. This is
-                                // suboptimal, but:
-                                //
-                                // - If we're at the start of the command buffer we have no choice anyway,
-                                //   because we have no knowledge about what comes before.
-                                // - If we're in the middle of the command buffer, this pipeline is going
-                                //   to be merged with an existing barrier. While it may still be
-                                //   suboptimal in some cases, in the general situation it will be ok.
-                                //
-                                unsafe {
-                                    let from_layout = if is_layout_initialized {
-                                        actually_exclusive = true;
-                                        initial_layout_requirement
-                                    } else {
-                                        if img.preinitialized_layout() {
-                                            ImageLayout::Preinitialized
-                                        } else {
-                                            ImageLayout::Undefined
-                                        }
-                                    };
-                                    if initial_layout_requirement != start_layout {
-                                        actual_start_layout = initial_layout_requirement;
-                                    }
-                                    let b = &mut self.pending_barrier;
-                                    b.add_image_memory_barrier(
-                                        img,
-                                        img.current_miplevels_access(),
-                                        img.current_layer_levels_access(),
-                                        PipelineStages {
-                                            bottom_of_pipe: true,
-                                            ..PipelineStages::none()
-                                        },
-                                        AccessFlags::none(),
-                                        memory.stages,
-                                        memory.access,
-                                        true,
-                                        None,
-                                        from_layout,
-                                        start_layout,
-                                    );
-                                    img.layout_initialized();
-                                }
-                            }
-                        }
-
-                        entry.insert(ResourceState {
-                            command_ids: vec![latest_command_id],
-                            resource_index,
-
-                            memory: PipelineMemoryAccess {
-                                stages: memory.stages,
-                                access: memory.access,
-                                exclusive: actually_exclusive,
-                            },
-                            exclusive_any: actually_exclusive,
-                            initial_layout: actual_start_layout,
-                            current_layout: end_layout, // TODO: what if we reach the end with Undefined? that's not correct?
-                            image_uninitialized_safe,
-                        });
-                    }
-                }
-
-                // Add the resources to the lists
-                // TODO: Perhaps any barriers for a resource in the secondary command buffer will "protect"
-                // its accesses so the primary needs less strict barriers.
-                // Less barriers is more efficient, so worth investigating!
-                let location = ResourceLocation {
-                    command_id: latest_command_id,
-                    resource_index,
-                };
-
-                match resource_ty {
-                    KeyTy::Buffer => {
-                        self.buffers.push((location, memory));
-                        last_cmd_buffer += 1;
-                    }
-                    KeyTy::Image => {
-                        self.images.push((
-                            location,
-                            memory,
-                            start_layout,
-                            end_layout,
-                            image_uninitialized_safe,
-                        ));
-                        last_cmd_image += 1;
-                    }
-                }
-            } else {
-                match resource_ty {
-                    KeyTy::Buffer => {
-                        last_cmd_buffer += 1;
-                    }
-                    KeyTy::Image => {
-                        last_cmd_image += 1;
-                    }
+                if let Some(previous_use) = self.find_image_conflict(
+                    image,
+                    subresource_range.clone(),
+                    memory,
+                    start_layout,
+                    end_layout,
+                ) {
+                    return Err(SyncCommandBufferBuilderError::Conflict {
+                        current_use_ref,
+                        previous_use_ref: previous_use,
+                    });
                 }
             }
         }
@@ -509,146 +233,667 @@ impl SyncCommandBufferBuilder {
         Ok(())
     }
 
+    fn find_buffer_conflict(
+        &self,
+        buffer: &Subbuffer<[u8]>,
+        mut range: Range<DeviceSize>,
+        memory: &PipelineMemoryAccess,
+    ) -> Option<ResourceUseRef> {
+        // Barriers work differently in render passes, so if we're in one, we can only insert a
+        // barrier before the start of the render pass.
+        let last_allowed_barrier_index =
+            self.latest_render_pass_enter.unwrap_or(self.commands.len());
+
+        range.start += buffer.offset();
+        range.end += buffer.offset();
+
+        let range_map = self.buffers2.get(buffer.buffer())?;
+
+        for (_range, state) in range_map
+            .range(&range)
+            .filter(|(_range, state)| !state.resource_uses.is_empty())
+        {
+            debug_assert!(state
+                .resource_uses
+                .iter()
+                .all(|resource_use| resource_use.command_index <= self.commands.len()));
+
+            if memory.exclusive || state.memory.exclusive {
+                // If there is a resource use at a position beyond where we can insert a
+                // barrier, then there is an unsolvable conflict.
+                if let Some(&use_ref) = state
+                    .resource_uses
+                    .iter()
+                    .find(|resource_use| resource_use.command_index >= last_allowed_barrier_index)
+                {
+                    return Some(use_ref);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn find_image_conflict(
+        &self,
+        image: &dyn ImageAccess,
+        mut subresource_range: ImageSubresourceRange,
+        memory: &PipelineMemoryAccess,
+        start_layout: ImageLayout,
+        _end_layout: ImageLayout,
+    ) -> Option<ResourceUseRef> {
+        // Barriers work differently in render passes, so if we're in one, we can only insert a
+        // barrier before the start of the render pass.
+        let last_allowed_barrier_index =
+            self.latest_render_pass_enter.unwrap_or(self.commands.len());
+
+        let inner = image.inner();
+        subresource_range.array_layers.start += inner.first_layer;
+        subresource_range.array_layers.end += inner.first_layer;
+        subresource_range.mip_levels.start += inner.first_mipmap_level;
+        subresource_range.mip_levels.end += inner.first_mipmap_level;
+
+        let range_map = self.images2.get(inner.image)?;
+
+        for range in inner.image.iter_ranges(subresource_range) {
+            for (_range, state) in range_map
+                .range(&range)
+                .filter(|(_range, state)| !state.resource_uses.is_empty())
+            {
+                debug_assert!(state
+                    .resource_uses
+                    .iter()
+                    .all(|resource_use| resource_use.command_index <= self.commands.len()));
+
+                // If the command expects the image to be undefined, then we can't
+                // transition it, so use the current layout for both old and new layout.
+                let start_layout = if start_layout == ImageLayout::Undefined {
+                    state.current_layout
+                } else {
+                    start_layout
+                };
+
+                if memory.exclusive
+                    || state.memory.exclusive
+                    || state.current_layout != start_layout
+                {
+                    // If there is a resource use at a position beyond where we can insert a
+                    // barrier, then there is an unsolvable conflict.
+                    if let Some(&use_ref) = state.resource_uses.iter().find(|resource_use| {
+                        resource_use.command_index >= last_allowed_barrier_index
+                    }) {
+                        return Some(use_ref);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Adds a command to be processed by the builder.
+    ///
+    /// The `resources` argument should contain each buffer or image used by the command.
+    /// The function will take care of handling the pipeline barrier or flushing.
+    ///
+    /// - The index of the resource within the `resources` slice maps to the resource accessed
+    ///   through `Command::buffer(..)` or `Command::image(..)`.
+    /// - `PipelineMemoryAccess` must match the way the resource has been used.
+    /// - `start_layout` and `end_layout` designate the image layout that the image is expected to
+    ///   be in when the command starts, and the image layout that the image will be transitioned to
+    ///   during the command. When it comes to buffers, you should pass `Undefined` for both.
+    pub(in crate::command_buffer) fn add_resource(&mut self, resource: (ResourceUseRef, Resource)) {
+        let (use_ref, resource) = resource;
+
+        match resource {
+            Resource::Buffer {
+                buffer,
+                range,
+                memory,
+            } => {
+                self.add_buffer(use_ref, buffer, range, memory);
+            }
+            Resource::Image {
+                image,
+                subresource_range,
+                memory,
+                start_layout,
+                end_layout,
+            } => {
+                self.add_image(
+                    use_ref,
+                    image,
+                    subresource_range,
+                    memory,
+                    start_layout,
+                    end_layout,
+                );
+            }
+        }
+    }
+
+    fn add_buffer(
+        &mut self,
+        use_ref: ResourceUseRef,
+        buffer: Subbuffer<[u8]>,
+        mut range: Range<DeviceSize>,
+        memory: PipelineMemoryAccess,
+    ) {
+        self.secondary_resources_usage
+            .buffers
+            .push(SecondaryCommandBufferBufferUsage {
+                use_ref,
+                buffer: buffer.clone(),
+                range: range.clone(),
+                memory,
+            });
+
+        // Barriers work differently in render passes, so if we're in one, we can only insert a
+        // barrier before the start of the render pass.
+        let last_allowed_barrier_index = self
+            .latest_render_pass_enter
+            .unwrap_or(self.commands.len() - 1);
+
+        range.start += buffer.offset();
+        range.end += buffer.offset();
+
+        let range_map = self
+            .buffers2
+            .entry(buffer.buffer().clone())
+            .or_insert_with(|| {
+                [(
+                    0..buffer.buffer().size(),
+                    BufferState {
+                        resource_uses: Vec::new(),
+                        memory: PipelineMemoryAccess::default(),
+                        exclusive_any: false,
+                    },
+                )]
+                .into_iter()
+                .collect()
+            });
+        range_map.split_at(&range.start);
+        range_map.split_at(&range.end);
+
+        for (range, state) in range_map.range_mut(&range) {
+            if state.resource_uses.is_empty() {
+                // This is the first time we use this resource range in this command buffer.
+                state.resource_uses.push(use_ref);
+                state.memory = PipelineMemoryAccess {
+                    stages: memory.stages,
+                    access: memory.access,
+                    exclusive: memory.exclusive,
+                };
+                state.exclusive_any = memory.exclusive;
+
+                match self.level {
+                    CommandBufferLevel::Primary => {
+                        // To be safe, we insert a barrier for all stages and accesses before
+                        // the first use, so that there are no hazards with any command buffer
+                        // that was previously submitted to the same queue.
+                        // This is rather overkill, but since command buffers don't know what
+                        // will come before them, it's the only thing that works for now.
+                        // TODO: come up with something better
+                        let barrier = BufferMemoryBarrier {
+                            src_stages: PipelineStages::ALL_COMMANDS,
+                            src_access: AccessFlags::MEMORY_READ | AccessFlags::MEMORY_WRITE,
+                            dst_stages: PipelineStages::ALL_COMMANDS,
+                            dst_access: AccessFlags::MEMORY_READ | AccessFlags::MEMORY_WRITE,
+                            range: range.clone(),
+                            ..BufferMemoryBarrier::buffer(buffer.buffer().clone())
+                        };
+
+                        self.pending_barrier.buffer_memory_barriers.push(barrier);
+                    }
+                    CommandBufferLevel::Secondary => (),
+                }
+            } else {
+                // This resource range was used before in this command buffer.
+
+                // Find out if we have a collision with the pending commands.
+                if memory.exclusive || state.memory.exclusive {
+                    // Collision found between `latest_command_id` and `collision_cmd_id`.
+
+                    // We now want to modify the current pipeline barrier in order to handle the
+                    // collision. But since the pipeline barrier is going to be submitted before
+                    // the flushed commands, it would be a mistake if `collision_cmd_id` hasn't
+                    // been flushed yet.
+                    if state
+                        .resource_uses
+                        .iter()
+                        .any(|resource_use| resource_use.command_index >= self.first_unflushed)
+                    {
+                        unsafe {
+                            // Flush the pending barrier.
+                            self.inner.pipeline_barrier(&self.pending_barrier);
+                            self.pending_barrier.clear();
+                            self.barriers.push(self.first_unflushed); // Track inserted barriers
+
+                            for command in
+                                &mut self.commands[self.first_unflushed..last_allowed_barrier_index]
+                            {
+                                command.send(&mut self.inner);
+                            }
+
+                            self.first_unflushed = last_allowed_barrier_index;
+                        }
+                    }
+
+                    // Modify the pipeline barrier to handle the collision.
+                    self.pending_barrier
+                        .buffer_memory_barriers
+                        .push(BufferMemoryBarrier {
+                            src_stages: state.memory.stages,
+                            src_access: state.memory.access,
+                            dst_stages: memory.stages,
+                            dst_access: memory.access,
+                            range: range.clone(),
+                            ..BufferMemoryBarrier::buffer(buffer.buffer().clone())
+                        });
+
+                    // Update state.
+                    state.memory = memory;
+                    state.exclusive_any = true;
+                } else {
+                    // There is no collision. Simply merge the stages and accesses.
+                    state.memory.stages |= memory.stages;
+                    state.memory.access |= memory.access;
+                }
+
+                state.resource_uses.push(use_ref);
+            }
+        }
+    }
+
+    fn add_image(
+        &mut self,
+        use_ref: ResourceUseRef,
+        image: Arc<dyn ImageAccess>,
+        mut subresource_range: ImageSubresourceRange,
+        memory: PipelineMemoryAccess,
+        start_layout: ImageLayout,
+        end_layout: ImageLayout,
+    ) {
+        self.secondary_resources_usage
+            .images
+            .push(SecondaryCommandBufferImageUsage {
+                use_ref,
+                image: image.clone(),
+                subresource_range: subresource_range.clone(),
+                memory,
+                start_layout,
+                end_layout,
+            });
+
+        // Barriers work differently in render passes, so if we're in one, we can only insert a
+        // barrier before the start of the render pass.
+        let last_allowed_barrier_index = self
+            .latest_render_pass_enter
+            .unwrap_or(self.commands.len() - 1);
+
+        let inner = image.inner();
+        subresource_range.array_layers.start += inner.first_layer;
+        subresource_range.array_layers.end += inner.first_layer;
+        subresource_range.mip_levels.start += inner.first_mipmap_level;
+        subresource_range.mip_levels.end += inner.first_mipmap_level;
+
+        // VUID-VkImageMemoryBarrier2-image-03320
+        if !self
+            .device()
+            .enabled_features()
+            .separate_depth_stencil_layouts
+            && image
+                .format()
+                .aspects()
+                .contains(ImageAspects::DEPTH | ImageAspects::STENCIL)
+        {
+            subresource_range.aspects = ImageAspects::DEPTH | ImageAspects::STENCIL;
+        }
+
+        let range_map = self.images2.entry(inner.image.clone()).or_insert_with(|| {
+            [(
+                0..inner.image.range_size(),
+                match self.level {
+                    CommandBufferLevel::Primary => {
+                        // In a primary command buffer, the initial layout is determined
+                        // by the image.
+                        let initial_layout = if !image.is_layout_initialized() {
+                            unsafe {
+                                image.layout_initialized();
+                            }
+
+                            image.initial_layout()
+                        } else {
+                            image.initial_layout_requirement()
+                        };
+
+                        ImageState {
+                            resource_uses: Vec::new(),
+                            memory: PipelineMemoryAccess::default(),
+                            exclusive_any: false,
+                            initial_layout,
+                            current_layout: initial_layout,
+                            final_layout: image.final_layout_requirement(),
+                        }
+                    }
+                    CommandBufferLevel::Secondary => {
+                        // In a secondary command buffer, the initial layout is the layout
+                        // of the first use.
+                        ImageState {
+                            resource_uses: Vec::new(),
+                            memory: PipelineMemoryAccess::default(),
+                            exclusive_any: false,
+                            initial_layout: ImageLayout::Undefined,
+                            current_layout: ImageLayout::Undefined,
+                            final_layout: ImageLayout::Undefined,
+                        }
+                    }
+                },
+            )]
+            .into_iter()
+            .collect()
+        });
+
+        for range in inner.image.iter_ranges(subresource_range) {
+            range_map.split_at(&range.start);
+            range_map.split_at(&range.end);
+
+            for (range, state) in range_map.range_mut(&range) {
+                if state.resource_uses.is_empty() {
+                    // This is the first time we use this resource range in this command buffer.
+
+                    debug_assert_eq!(state.initial_layout, state.current_layout);
+
+                    state.resource_uses.push(use_ref);
+                    state.memory = PipelineMemoryAccess {
+                        stages: memory.stages,
+                        access: memory.access,
+                        exclusive: memory.exclusive,
+                    };
+                    state.exclusive_any = memory.exclusive;
+                    state.current_layout = end_layout;
+
+                    match self.level {
+                        CommandBufferLevel::Primary => {
+                            // To be safe, we insert a barrier for all stages and accesses before
+                            // the first use, so that there are no hazards with any command buffer
+                            // that was previously submitted to the same queue.
+                            // This is rather overkill, but since command buffers don't know what
+                            // will come before them, it's the only thing that works for now.
+                            // TODO: come up with something better
+                            let mut barrier = ImageMemoryBarrier {
+                                src_stages: PipelineStages::ALL_COMMANDS,
+                                src_access: AccessFlags::MEMORY_READ | AccessFlags::MEMORY_WRITE,
+                                dst_stages: PipelineStages::ALL_COMMANDS,
+                                dst_access: AccessFlags::MEMORY_READ | AccessFlags::MEMORY_WRITE,
+                                old_layout: state.initial_layout,
+                                new_layout: start_layout,
+                                subresource_range: inner.image.range_to_subresources(range.clone()),
+                                ..ImageMemoryBarrier::image(inner.image.clone())
+                            };
+
+                            // If the `new_layout` is Undefined or Preinitialized, this requires
+                            // special handling. With the synchronization2 feature enabled, these
+                            // values are permitted, as long as `new_layout` equals `old_layout`.
+                            // Without synchronization2, these values are never permitted.
+                            match barrier.new_layout {
+                                ImageLayout::Undefined => {
+                                    // If the command expects Undefined, that really means it
+                                    // doesn't care about the layout at all and anything is valid.
+                                    // We try to keep the old layout, or do a "dummy" transition to
+                                    // the image's final layout if that isn't possible.
+                                    barrier.new_layout =
+                                        if !self.inner.device.enabled_features().synchronization2
+                                            && matches!(
+                                                barrier.old_layout,
+                                                ImageLayout::Undefined
+                                                    | ImageLayout::Preinitialized
+                                            )
+                                        {
+                                            image.final_layout_requirement()
+                                        } else {
+                                            barrier.old_layout
+                                        };
+                                }
+                                ImageLayout::Preinitialized => {
+                                    // TODO: put this in find_image_conflict instead?
+
+                                    // The image must be in the Preinitialized layout already, we
+                                    // can't transition it.
+                                    if state.initial_layout != ImageLayout::Preinitialized {
+                                        panic!(
+                                            "The command requires the `Preinitialized layout`, but
+                                            the initial layout of the image is not `Preinitialized`"
+                                        );
+                                    }
+
+                                    // The image is in the Preinitialized layout, but we can't keep
+                                    // that layout because of the limitations of
+                                    // pre-synchronization2 barriers. So an error is all we can do.
+                                    if !self.inner.device.enabled_features().synchronization2 {
+                                        panic!(
+                                            "The command requires the `Preinitialized` layout, \
+                                            but this is not allowed in pipeline barriers without
+                                            the `synchronization2` feature enabled"
+                                        );
+                                    }
+                                }
+                                _ => (),
+                            }
+
+                            // A layout transition is a write, so if we perform one, we
+                            // need exclusive access.
+                            if barrier.old_layout != barrier.new_layout {
+                                state.exclusive_any = true;
+                            }
+
+                            self.pending_barrier.image_memory_barriers.push(barrier);
+                        }
+                        CommandBufferLevel::Secondary => {
+                            state.initial_layout = start_layout;
+                        }
+                    }
+                } else {
+                    // This resource range was used before in this command buffer.
+
+                    // If the command expects the image to be undefined, then we can't
+                    // transition it, so use the current layout for both old and new layout.
+                    let start_layout = if start_layout == ImageLayout::Undefined {
+                        state.current_layout
+                    } else {
+                        start_layout
+                    };
+
+                    // Find out if we have a collision with the pending commands.
+                    if memory.exclusive
+                        || state.memory.exclusive
+                        || state.current_layout != start_layout
+                    {
+                        // Collision found between `latest_command_id` and `collision_cmd_id`.
+
+                        // We now want to modify the current pipeline barrier in order to handle the
+                        // collision. But since the pipeline barrier is going to be submitted before
+                        // the flushed commands, it would be a mistake if `collision_cmd_id` hasn't
+                        // been flushed yet.
+                        if state
+                            .resource_uses
+                            .iter()
+                            .any(|resource_use| resource_use.command_index >= self.first_unflushed)
+                            || state.current_layout != start_layout
+                        {
+                            unsafe {
+                                // Flush the pending barrier.
+                                self.inner.pipeline_barrier(&self.pending_barrier);
+                                self.pending_barrier.clear();
+                                self.barriers.push(self.first_unflushed); // Track inserted barriers
+
+                                for command in &mut self.commands
+                                    [self.first_unflushed..last_allowed_barrier_index]
+                                {
+                                    command.send(&mut self.inner);
+                                }
+                                self.first_unflushed = last_allowed_barrier_index;
+                            }
+                        }
+
+                        // Modify the pipeline barrier to handle the collision.
+                        self.pending_barrier
+                            .image_memory_barriers
+                            .push(ImageMemoryBarrier {
+                                src_stages: state.memory.stages,
+                                src_access: state.memory.access,
+                                dst_stages: memory.stages,
+                                dst_access: memory.access,
+                                old_layout: state.current_layout,
+                                new_layout: start_layout,
+                                subresource_range: inner.image.range_to_subresources(range.clone()),
+                                ..ImageMemoryBarrier::image(inner.image.clone())
+                            });
+
+                        // Update state.
+                        state.memory = memory;
+                        state.exclusive_any = true;
+                        if memory.exclusive || end_layout != ImageLayout::Undefined {
+                            // Only modify the layout in case of a write, because buffer operations
+                            // pass `Undefined` for the layout. While a buffer write *must* set the
+                            // layout to `Undefined`, a buffer read must not touch it.
+                            state.current_layout = end_layout;
+                        }
+                    } else {
+                        // There is no collision. Simply merge the stages and accesses.
+                        state.memory.stages |= memory.stages;
+                        state.memory.access |= memory.access;
+                    }
+
+                    state.resource_uses.push(use_ref);
+                }
+            }
+        }
+    }
+
     /// Builds the command buffer and turns it into a `SyncCommandBuffer`.
     #[inline]
     pub fn build(mut self) -> Result<SyncCommandBuffer, OomError> {
-        // TODO: see comment for the `is_poisoned` member in the struct
-        assert!(
-            !self.is_poisoned,
-            "The builder has been put in an inconsistent state by a previous error"
-        );
-
         debug_assert!(self.latest_render_pass_enter.is_none() || self.pending_barrier.is_empty());
 
         // The commands that haven't been sent to the inner command buffer yet need to be sent.
         unsafe {
             self.inner.pipeline_barrier(&self.pending_barrier);
+            self.pending_barrier.clear();
             let start = self.first_unflushed;
             self.barriers.push(start); // Track inserted barriers
+
             for command in &mut self.commands[start..] {
                 command.send(&mut self.inner);
             }
         }
 
         // Transition images to their desired final layout.
-        if !self.is_secondary {
+        if self.level == CommandBufferLevel::Primary {
             unsafe {
-                // TODO: this could be optimized by merging the barrier with the barrier above?
-                let mut barrier = UnsafeCommandBufferBuilderPipelineBarrier::new();
+                for (image, range_map) in self.images2.iter_mut() {
+                    for (range, state) in range_map
+                        .iter_mut()
+                        .filter(|(_range, state)| state.final_layout != state.current_layout)
+                    {
+                        self.pending_barrier
+                            .image_memory_barriers
+                            .push(ImageMemoryBarrier {
+                                src_stages: state.memory.stages,
+                                src_access: state.memory.access,
+                                dst_stages: PipelineStages::TOP_OF_PIPE,
+                                dst_access: AccessFlags::empty(),
+                                old_layout: state.current_layout,
+                                new_layout: state.final_layout,
+                                subresource_range: image.range_to_subresources(range.clone()),
+                                ..ImageMemoryBarrier::image(image.clone())
+                            });
 
-                for (key, state) in self
-                    .resources
-                    .iter_mut()
-                    .filter(|(key, _)| matches!(key, ResourceKey::Image(..)))
-                {
-                    let img = self.commands[state.command_ids[0]].image(state.resource_index);
-                    let requested_layout = img.final_layout_requirement();
-                    if requested_layout == state.current_layout {
-                        continue;
+                        state.exclusive_any = true;
                     }
-
-                    barrier.add_image_memory_barrier(
-                        img,
-                        img.current_miplevels_access(),
-                        img.current_layer_levels_access(),
-                        state.memory.stages,
-                        state.memory.access,
-                        PipelineStages {
-                            top_of_pipe: true,
-                            ..PipelineStages::none()
-                        },
-                        AccessFlags::none(),
-                        true,
-                        None, // TODO: queue transfers?
-                        state.current_layout,
-                        requested_layout,
-                    );
-
-                    state.exclusive_any = true;
-                    state.current_layout = requested_layout;
                 }
 
-                self.inner.pipeline_barrier(&barrier);
+                self.inner.pipeline_barrier(&self.pending_barrier);
             }
         }
 
-        // Build the final resources states.
-        let final_resources_states: FnvHashMap<_, _> = {
-            self.resources
+        let mut resource_usage = CommandBufferResourcesUsage {
+            buffers: self
+                .buffers2
                 .into_iter()
-                .map(|(resource, state)| {
-                    let final_state = ResourceFinalState {
-                        command_ids: state.command_ids,
-                        resource_index: state.resource_index,
-                        final_stages: state.memory.stages,
-                        final_access: state.memory.access,
-                        exclusive: state.exclusive_any,
-                        initial_layout: state.initial_layout,
-                        final_layout: state.current_layout,
-                        image_uninitialized_safe: state.image_uninitialized_safe,
-                    };
-                    (resource, final_state)
+                .map(|(buffer, ranges)| CommandBufferBufferUsage {
+                    buffer,
+                    ranges: ranges
+                        .into_iter()
+                        .filter(|(_range, state)| !state.resource_uses.is_empty())
+                        .map(|(range, state)| {
+                            let first_use = state.resource_uses.into_iter().next();
+                            (
+                                range,
+                                CommandBufferBufferRangeUsage {
+                                    first_use,
+                                    mutable: state.exclusive_any,
+                                },
+                            )
+                        })
+                        .collect(),
                 })
-                .collect()
+                .collect(),
+            images: self
+                .images2
+                .into_iter()
+                .map(|(image, ranges)| CommandBufferImageUsage {
+                    image,
+                    ranges: ranges
+                        .into_iter()
+                        .filter(|(_range, state)| {
+                            !state.resource_uses.is_empty()
+                                || (self.level == CommandBufferLevel::Primary
+                                    && state.current_layout != state.final_layout)
+                        })
+                        .map(|(range, mut state)| {
+                            if self.level == CommandBufferLevel::Primary {
+                                state.current_layout = state.final_layout;
+                            }
+
+                            let first_use = state.resource_uses.into_iter().next();
+                            (
+                                range,
+                                CommandBufferImageRangeUsage {
+                                    first_use,
+                                    mutable: state.exclusive_any,
+                                    expected_layout: state.initial_layout,
+                                    final_layout: state.current_layout,
+                                },
+                            )
+                        })
+                        .collect(),
+                })
+                .collect(),
+            buffer_indices: Default::default(),
+            image_indices: Default::default(),
         };
+
+        resource_usage.buffer_indices = resource_usage
+            .buffers
+            .iter()
+            .enumerate()
+            .map(|(index, usage)| (usage.buffer.clone(), index))
+            .collect();
+        resource_usage.image_indices = resource_usage
+            .images
+            .iter()
+            .enumerate()
+            .map(|(index, usage)| (usage.image.clone(), index))
+            .collect();
 
         Ok(SyncCommandBuffer {
             inner: self.inner.build()?,
-            buffers: self.buffers,
-            images: self.images,
-            resources: final_resources_states,
-            commands: self.commands,
-            barriers: self.barriers,
+            resources_usage: resource_usage,
+            secondary_resources_usage: self.secondary_resources_usage,
+            _commands: self.commands,
+            _barriers: self.barriers,
         })
-    }
-
-    /// Returns the descriptor set currently bound to a given set number, or `None` if nothing has
-    /// been bound yet.
-    pub(crate) fn bound_descriptor_set(
-        &self,
-        pipeline_bind_point: PipelineBindPoint,
-        set_num: u32,
-    ) -> Option<(&dyn DescriptorSet, &[u32])> {
-        self.bindings
-            .descriptor_sets
-            .get(&pipeline_bind_point)
-            .and_then(|sets| {
-                sets.get(&set_num)
-                    .map(|cmd| cmd.bound_descriptor_set(set_num))
-            })
-    }
-
-    /// Returns the index buffer currently bound, or `None` if nothing has been bound yet.
-    pub(crate) fn bound_index_buffer(&self) -> Option<&dyn BufferAccess> {
-        self.bindings
-            .index_buffer
-            .as_ref()
-            .map(|cmd| cmd.bound_index_buffer())
-    }
-
-    /// Returns the compute pipeline currently bound, or `None` if nothing has been bound yet.
-    pub(crate) fn bound_pipeline_compute(&self) -> Option<&dyn ComputePipelineAbstract> {
-        self.bindings
-            .pipeline_compute
-            .as_ref()
-            .map(|cmd| cmd.bound_pipeline_compute())
-    }
-
-    /// Returns the graphics pipeline currently bound, or `None` if nothing has been bound yet.
-    pub(crate) fn bound_pipeline_graphics(&self) -> Option<&dyn GraphicsPipelineAbstract> {
-        self.bindings
-            .pipeline_graphics
-            .as_ref()
-            .map(|cmd| cmd.bound_pipeline_graphics())
-    }
-
-    /// Returns the vertex buffer currently bound to a given binding slot number, or `None` if
-    /// nothing has been bound yet.
-    pub(crate) fn bound_vertex_buffer(&self, binding_num: u32) -> Option<&dyn BufferAccess> {
-        self.bindings
-            .vertex_buffers
-            .get(&binding_num)
-            .map(|cmd| cmd.bound_vertex_buffer(binding_num))
     }
 }
 
@@ -659,10 +904,9 @@ unsafe impl DeviceOwned for SyncCommandBufferBuilder {
     }
 }
 
-impl fmt::Debug for SyncCommandBufferBuilder {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(&self.inner, f)
+impl Debug for SyncCommandBufferBuilder {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
+        Debug::fmt(&self.inner, f)
     }
 }
 
@@ -671,52 +915,49 @@ impl fmt::Debug for SyncCommandBufferBuilder {
 pub enum SyncCommandBufferBuilderError {
     /// Unsolvable conflict.
     Conflict {
-        command1_name: &'static str,
-        command1_param: Cow<'static, str>,
-        command1_offset: usize,
-
-        command2_name: &'static str,
-        command2_param: Cow<'static, str>,
-        command2_offset: usize,
+        current_use_ref: ResourceUseRef,
+        previous_use_ref: ResourceUseRef,
     },
 
     ExecError(CommandBufferExecError),
 }
 
-impl error::Error for SyncCommandBufferBuilderError {}
+impl Error for SyncCommandBufferBuilderError {}
 
-impl fmt::Display for SyncCommandBufferBuilderError {
-    #[inline]
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+impl Display for SyncCommandBufferBuilderError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         match self {
-            SyncCommandBufferBuilderError::Conflict { .. } => write!(fmt, "unsolvable conflict"),
-            SyncCommandBufferBuilderError::ExecError(err) => err.fmt(fmt),
+            SyncCommandBufferBuilderError::Conflict { .. } => write!(f, "unsolvable conflict"),
+            SyncCommandBufferBuilderError::ExecError(err) => Display::fmt(err, f),
         }
     }
 }
 
 impl From<CommandBufferExecError> for SyncCommandBufferBuilderError {
-    #[inline]
     fn from(val: CommandBufferExecError) -> Self {
         SyncCommandBufferBuilderError::ExecError(val)
     }
 }
 
-/// Type of resource whose state is to be tracked.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum KeyTy {
-    Buffer,
-    Image,
+// State of a resource during the building of the command buffer.
+#[derive(Clone, PartialEq, Eq)]
+struct BufferState {
+    // Lists every use of the resource.
+    resource_uses: Vec<ResourceUseRef>,
+
+    // Memory access of the command that last used this resource.
+    memory: PipelineMemoryAccess,
+
+    // True if the resource was used in exclusive mode at any point during the building of the
+    // command buffer. Also true if an image layout transition or queue transfer has been performed.
+    exclusive_any: bool,
 }
 
 // State of a resource during the building of the command buffer.
-#[derive(Debug, Clone)]
-struct ResourceState {
-    // Indices of the commands that contain the resource.
-    command_ids: Vec<usize>,
-
-    // Index of the resource within the first command in `command_ids`.
-    resource_index: usize,
+#[derive(Clone, PartialEq, Eq)]
+struct ImageState {
+    // Lists every use of the resource.
+    resource_uses: Vec<ResourceUseRef>,
 
     // Memory access of the command that last used this resource.
     memory: PipelineMemoryAccess,
@@ -725,24 +966,494 @@ struct ResourceState {
     // command buffer. Also true if an image layout transition or queue transfer has been performed.
     exclusive_any: bool,
 
-    // Layout at the first use of the resource by the command buffer. Can be `Undefined` if we
-    // don't care.
+    // The layout that the image range must have when this command buffer is executed.
+    // Can be `Undefined` if we don't care.
     initial_layout: ImageLayout,
 
     // Current layout at this stage of the building.
     current_layout: ImageLayout,
 
-    // Extra context of how the image will be used
-    image_uninitialized_safe: ImageUninitializedSafe,
+    // The layout that the image range will have at the end of the command buffer.
+    // This is only used for primary command buffers.
+    final_layout: ImageLayout,
 }
 
-/// Holds the index of the most recent command that binds a particular resource, or `None` if
-/// nothing has been bound yet.
-#[derive(Debug, Default)]
-struct BindingState {
-    descriptor_sets: FnvHashMap<PipelineBindPoint, FnvHashMap<u32, Arc<dyn Command + Send + Sync>>>,
-    index_buffer: Option<Arc<dyn Command + Send + Sync>>,
-    pipeline_compute: Option<Arc<dyn Command + Send + Sync>>,
-    pipeline_graphics: Option<Arc<dyn Command + Send + Sync>>,
-    vertex_buffers: FnvHashMap<u32, Arc<dyn Command + Send + Sync>>,
+/// Holds the current binding and setting state.
+#[derive(Default)]
+pub(in crate::command_buffer) struct CurrentState {
+    pub(in crate::command_buffer) descriptor_sets: HashMap<PipelineBindPoint, DescriptorSetState>,
+    pub(in crate::command_buffer) index_buffer: Option<(Subbuffer<[u8]>, IndexType)>,
+    pub(in crate::command_buffer) pipeline_compute: Option<Arc<ComputePipeline>>,
+    pub(in crate::command_buffer) pipeline_graphics: Option<Arc<GraphicsPipeline>>,
+    pub(in crate::command_buffer) vertex_buffers: HashMap<u32, Subbuffer<[u8]>>,
+
+    pub(in crate::command_buffer) push_constants: RangeSet<u32>,
+    pub(in crate::command_buffer) push_constants_pipeline_layout: Option<Arc<PipelineLayout>>,
+
+    pub(in crate::command_buffer) blend_constants: Option<[f32; 4]>,
+    pub(in crate::command_buffer) color_write_enable: Option<SmallVec<[bool; 4]>>,
+    pub(in crate::command_buffer) cull_mode: Option<CullMode>,
+    pub(in crate::command_buffer) depth_bias: Option<DepthBias>,
+    pub(in crate::command_buffer) depth_bias_enable: Option<bool>,
+    pub(in crate::command_buffer) depth_bounds: Option<RangeInclusive<f32>>,
+    pub(in crate::command_buffer) depth_bounds_test_enable: Option<bool>,
+    pub(in crate::command_buffer) depth_compare_op: Option<CompareOp>,
+    pub(in crate::command_buffer) depth_test_enable: Option<bool>,
+    pub(in crate::command_buffer) depth_write_enable: Option<bool>,
+    pub(in crate::command_buffer) discard_rectangle: HashMap<u32, Scissor>,
+    pub(in crate::command_buffer) front_face: Option<FrontFace>,
+    pub(in crate::command_buffer) line_stipple: Option<LineStipple>,
+    pub(in crate::command_buffer) line_width: Option<f32>,
+    pub(in crate::command_buffer) logic_op: Option<LogicOp>,
+    pub(in crate::command_buffer) patch_control_points: Option<u32>,
+    pub(in crate::command_buffer) primitive_restart_enable: Option<bool>,
+    pub(in crate::command_buffer) primitive_topology: Option<PrimitiveTopology>,
+    pub(in crate::command_buffer) rasterizer_discard_enable: Option<bool>,
+    pub(in crate::command_buffer) scissor: HashMap<u32, Scissor>,
+    pub(in crate::command_buffer) scissor_with_count: Option<SmallVec<[Scissor; 2]>>,
+    pub(in crate::command_buffer) stencil_compare_mask: StencilStateDynamic,
+    pub(in crate::command_buffer) stencil_op: StencilOpStateDynamic,
+    pub(in crate::command_buffer) stencil_reference: StencilStateDynamic,
+    pub(in crate::command_buffer) stencil_test_enable: Option<bool>,
+    pub(in crate::command_buffer) stencil_write_mask: StencilStateDynamic,
+    pub(in crate::command_buffer) viewport: HashMap<u32, Viewport>,
+    pub(in crate::command_buffer) viewport_with_count: Option<SmallVec<[Viewport; 2]>>,
+}
+
+impl CurrentState {
+    pub(in crate::command_buffer) fn reset_dynamic_states(
+        &mut self,
+        states: impl IntoIterator<Item = DynamicState>,
+    ) {
+        for state in states {
+            match state {
+                DynamicState::BlendConstants => self.blend_constants = None,
+                DynamicState::ColorWriteEnable => self.color_write_enable = None,
+                DynamicState::CullMode => self.cull_mode = None,
+                DynamicState::DepthBias => self.depth_bias = None,
+                DynamicState::DepthBiasEnable => self.depth_bias_enable = None,
+                DynamicState::DepthBounds => self.depth_bounds = None,
+                DynamicState::DepthBoundsTestEnable => self.depth_bounds_test_enable = None,
+                DynamicState::DepthCompareOp => self.depth_compare_op = None,
+                DynamicState::DepthTestEnable => self.depth_test_enable = None,
+                DynamicState::DepthWriteEnable => self.depth_write_enable = None,
+                DynamicState::DiscardRectangle => self.discard_rectangle.clear(),
+                DynamicState::ExclusiveScissor => (), // TODO;
+                DynamicState::FragmentShadingRate => (), // TODO:
+                DynamicState::FrontFace => self.front_face = None,
+                DynamicState::LineStipple => self.line_stipple = None,
+                DynamicState::LineWidth => self.line_width = None,
+                DynamicState::LogicOp => self.logic_op = None,
+                DynamicState::PatchControlPoints => self.patch_control_points = None,
+                DynamicState::PrimitiveRestartEnable => self.primitive_restart_enable = None,
+                DynamicState::PrimitiveTopology => self.primitive_topology = None,
+                DynamicState::RasterizerDiscardEnable => self.rasterizer_discard_enable = None,
+                DynamicState::RayTracingPipelineStackSize => (), // TODO:
+                DynamicState::SampleLocations => (),             // TODO:
+                DynamicState::Scissor => self.scissor.clear(),
+                DynamicState::ScissorWithCount => self.scissor_with_count = None,
+                DynamicState::StencilCompareMask => self.stencil_compare_mask = Default::default(),
+                DynamicState::StencilOp => self.stencil_op = Default::default(),
+                DynamicState::StencilReference => self.stencil_reference = Default::default(),
+                DynamicState::StencilTestEnable => self.stencil_test_enable = None,
+                DynamicState::StencilWriteMask => self.stencil_write_mask = Default::default(),
+                DynamicState::VertexInput => (), // TODO:
+                DynamicState::VertexInputBindingStride => (), // TODO:
+                DynamicState::Viewport => self.viewport.clear(),
+                DynamicState::ViewportCoarseSampleOrder => (), // TODO:
+                DynamicState::ViewportShadingRatePalette => (), // TODO:
+                DynamicState::ViewportWScaling => (),          // TODO:
+                DynamicState::ViewportWithCount => self.viewport_with_count = None,
+                DynamicState::TessellationDomainOrigin => (), // TODO:
+                DynamicState::DepthClampEnable => (),         // TODO:
+                DynamicState::PolygonMode => (),              // TODO:
+                DynamicState::RasterizationSamples => (),     // TODO:
+                DynamicState::SampleMask => (),               // TODO:
+                DynamicState::AlphaToCoverageEnable => (),    // TODO:
+                DynamicState::AlphaToOneEnable => (),         // TODO:
+                DynamicState::LogicOpEnable => (),            // TODO:
+                DynamicState::ColorBlendEnable => (),         // TODO:
+                DynamicState::ColorBlendEquation => (),       // TODO:
+                DynamicState::ColorWriteMask => (),           // TODO:
+                DynamicState::RasterizationStream => (),      // TODO:
+                DynamicState::ConservativeRasterizationMode => (), // TODO:
+                DynamicState::ExtraPrimitiveOverestimationSize => (), // TODO:
+                DynamicState::DepthClipEnable => (),          // TODO:
+                DynamicState::SampleLocationsEnable => (),    // TODO:
+                DynamicState::ColorBlendAdvanced => (),       // TODO:
+                DynamicState::ProvokingVertexMode => (),      // TODO:
+                DynamicState::LineRasterizationMode => (),    // TODO:
+                DynamicState::LineStippleEnable => (),        // TODO:
+                DynamicState::DepthClipNegativeOneToOne => (), // TODO:
+                DynamicState::ViewportWScalingEnable => (),   // TODO:
+                DynamicState::ViewportSwizzle => (),          // TODO:
+                DynamicState::CoverageToColorEnable => (),    // TODO:
+                DynamicState::CoverageToColorLocation => (),  // TODO:
+                DynamicState::CoverageModulationMode => (),   // TODO:
+                DynamicState::CoverageModulationTableEnable => (), // TODO:
+                DynamicState::CoverageModulationTable => (),  // TODO:
+                DynamicState::ShadingRateImageEnable => (),   // TODO:
+                DynamicState::RepresentativeFragmentTestEnable => (), // TODO:
+                DynamicState::CoverageReductionMode => (),    // TODO:
+            }
+        }
+    }
+
+    pub(in crate::command_buffer) fn invalidate_descriptor_sets(
+        &mut self,
+        pipeline_bind_point: PipelineBindPoint,
+        pipeline_layout: Arc<PipelineLayout>,
+        first_set: u32,
+        num_descriptor_sets: u32,
+    ) -> &mut DescriptorSetState {
+        match self.descriptor_sets.entry(pipeline_bind_point) {
+            Entry::Vacant(entry) => entry.insert(DescriptorSetState {
+                descriptor_sets: Default::default(),
+                pipeline_layout,
+            }),
+            Entry::Occupied(entry) => {
+                let state = entry.into_mut();
+
+                let invalidate_from = if state.pipeline_layout.handle() == pipeline_layout.handle()
+                {
+                    // If we're still using the exact same layout, then of course it's compatible.
+                    None
+                } else if state.pipeline_layout.push_constant_ranges()
+                    != pipeline_layout.push_constant_ranges()
+                {
+                    // If the push constant ranges don't match,
+                    // all bound descriptor sets are disturbed.
+                    Some(0)
+                } else {
+                    // Find the first descriptor set layout in the current pipeline layout that
+                    // isn't compatible with the corresponding set in the new pipeline layout.
+                    // If an incompatible set was found, all bound sets from that slot onwards will
+                    // be disturbed.
+                    let current_layouts = state.pipeline_layout.set_layouts();
+                    let new_layouts = pipeline_layout.set_layouts();
+                    let max = (current_layouts.len() as u32).min(first_set + num_descriptor_sets);
+                    (0..max).find(|&num| {
+                        let num = num as usize;
+                        !current_layouts[num].is_compatible_with(&new_layouts[num])
+                    })
+                };
+
+                if let Some(invalidate_from) = invalidate_from {
+                    // Remove disturbed sets and set new pipeline layout.
+                    state
+                        .descriptor_sets
+                        .retain(|&num, _| num < invalidate_from);
+                    state.pipeline_layout = pipeline_layout;
+                } else if (first_set + num_descriptor_sets) as usize
+                    >= state.pipeline_layout.set_layouts().len()
+                {
+                    // New layout is a superset of the old one.
+                    state.pipeline_layout = pipeline_layout;
+                }
+
+                state
+            }
+        }
+    }
+}
+
+pub(in crate::command_buffer) struct DescriptorSetState {
+    pub(in crate::command_buffer) descriptor_sets: HashMap<u32, SetOrPush>,
+    pub(in crate::command_buffer) pipeline_layout: Arc<PipelineLayout>,
+}
+
+#[derive(Clone)]
+pub enum SetOrPush {
+    Set(DescriptorSetWithOffsets),
+    Push(DescriptorSetResources),
+}
+
+impl SetOrPush {
+    #[inline]
+    pub fn resources(&self) -> &DescriptorSetResources {
+        match self {
+            Self::Set(set) => set.as_ref().0.resources(),
+            Self::Push(resources) => resources,
+        }
+    }
+
+    #[inline]
+    pub fn dynamic_offsets(&self) -> &[u32] {
+        match self {
+            Self::Set(set) => set.as_ref().1,
+            Self::Push(_) => &[],
+        }
+    }
+}
+
+/// Allows you to retrieve the current state of a command buffer builder.
+#[derive(Clone, Copy)]
+pub struct CommandBufferBuilderState<'a> {
+    current_state: &'a CurrentState,
+}
+
+impl<'a> CommandBufferBuilderState<'a> {
+    /// Returns the descriptor set currently bound to a given set number, or `None` if nothing has
+    /// been bound yet.
+    #[inline]
+    pub fn descriptor_set(
+        &self,
+        pipeline_bind_point: PipelineBindPoint,
+        set_num: u32,
+    ) -> Option<&'a SetOrPush> {
+        self.current_state
+            .descriptor_sets
+            .get(&pipeline_bind_point)
+            .and_then(|state| state.descriptor_sets.get(&set_num))
+    }
+
+    /// Returns the pipeline layout that describes all currently bound descriptor sets.
+    ///
+    /// This can be the layout used to perform the last bind operation, but it can also be the
+    /// layout of an earlier bind if it was compatible with more recent binds.
+    #[inline]
+    pub fn descriptor_sets_pipeline_layout(
+        &self,
+        pipeline_bind_point: PipelineBindPoint,
+    ) -> Option<&'a Arc<PipelineLayout>> {
+        self.current_state
+            .descriptor_sets
+            .get(&pipeline_bind_point)
+            .map(|state| &state.pipeline_layout)
+    }
+
+    /// Returns the index buffer currently bound, or `None` if nothing has been bound yet.
+    #[inline]
+    pub fn index_buffer(&self) -> Option<(&'a Subbuffer<[u8]>, IndexType)> {
+        self.current_state
+            .index_buffer
+            .as_ref()
+            .map(|(b, i)| (b, *i))
+    }
+
+    /// Returns the compute pipeline currently bound, or `None` if nothing has been bound yet.
+    #[inline]
+    pub fn pipeline_compute(&self) -> Option<&'a Arc<ComputePipeline>> {
+        self.current_state.pipeline_compute.as_ref()
+    }
+
+    /// Returns the graphics pipeline currently bound, or `None` if nothing has been bound yet.
+    #[inline]
+    pub fn pipeline_graphics(&self) -> Option<&'a Arc<GraphicsPipeline>> {
+        self.current_state.pipeline_graphics.as_ref()
+    }
+
+    /// Returns the vertex buffer currently bound to a given binding slot number, or `None` if
+    /// nothing has been bound yet.
+    #[inline]
+    pub fn vertex_buffer(&self, binding_num: u32) -> Option<&'a Subbuffer<[u8]>> {
+        self.current_state.vertex_buffers.get(&binding_num)
+    }
+
+    /// Returns a set containing push constant bytes that have been set.
+    #[inline]
+    pub fn push_constants(&self) -> &'a RangeSet<u32> {
+        &self.current_state.push_constants
+    }
+
+    /// Returns the pipeline layout that describes the current push constants.
+    ///
+    /// This is the layout used to perform the last push constant write operation.
+    #[inline]
+    pub fn push_constants_pipeline_layout(&self) -> Option<&'a Arc<PipelineLayout>> {
+        self.current_state.push_constants_pipeline_layout.as_ref()
+    }
+
+    /// Returns the current blend constants, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn blend_constants(&self) -> Option<[f32; 4]> {
+        self.current_state.blend_constants
+    }
+
+    /// Returns the current color write enable settings, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn color_write_enable(&self) -> Option<&'a [bool]> {
+        self.current_state
+            .color_write_enable
+            .as_ref()
+            .map(|x| x.as_slice())
+    }
+
+    /// Returns the current cull mode, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn cull_mode(&self) -> Option<CullMode> {
+        self.current_state.cull_mode
+    }
+
+    /// Returns the current depth bias settings, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn depth_bias(&self) -> Option<DepthBias> {
+        self.current_state.depth_bias
+    }
+
+    /// Returns whether depth bias is enabled, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn depth_bias_enable(&self) -> Option<bool> {
+        self.current_state.depth_bias_enable
+    }
+
+    /// Returns the current depth bounds settings, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn depth_bounds(&self) -> Option<RangeInclusive<f32>> {
+        self.current_state.depth_bounds.clone()
+    }
+
+    /// Returns whether depth bound testing is enabled, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn depth_bounds_test_enable(&self) -> Option<bool> {
+        self.current_state.depth_bounds_test_enable
+    }
+
+    /// Returns the current depth compare op, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn depth_compare_op(&self) -> Option<CompareOp> {
+        self.current_state.depth_compare_op
+    }
+
+    /// Returns whether depth testing is enabled, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn depth_test_enable(&self) -> Option<bool> {
+        self.current_state.depth_test_enable
+    }
+
+    /// Returns whether depth write is enabled, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn depth_write_enable(&self) -> Option<bool> {
+        self.current_state.depth_write_enable
+    }
+
+    /// Returns the current discard rectangles, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn discard_rectangle(&self, num: u32) -> Option<&'a Scissor> {
+        self.current_state.discard_rectangle.get(&num)
+    }
+
+    /// Returns the current front face, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn front_face(&self) -> Option<FrontFace> {
+        self.current_state.front_face
+    }
+
+    /// Returns the current line stipple settings, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn line_stipple(&self) -> Option<LineStipple> {
+        self.current_state.line_stipple
+    }
+
+    /// Returns the current line width, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn line_width(&self) -> Option<f32> {
+        self.current_state.line_width
+    }
+
+    /// Returns the current logic op, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn logic_op(&self) -> Option<LogicOp> {
+        self.current_state.logic_op
+    }
+
+    /// Returns the current number of patch control points, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn patch_control_points(&self) -> Option<u32> {
+        self.current_state.patch_control_points
+    }
+
+    /// Returns whether primitive restart is enabled, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn primitive_restart_enable(&self) -> Option<bool> {
+        self.current_state.primitive_restart_enable
+    }
+
+    /// Returns the current primitive topology, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn primitive_topology(&self) -> Option<PrimitiveTopology> {
+        self.current_state.primitive_topology
+    }
+
+    /// Returns whether rasterizer discard is enabled, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn rasterizer_discard_enable(&self) -> Option<bool> {
+        self.current_state.rasterizer_discard_enable
+    }
+
+    /// Returns the current scissor for a given viewport slot, or `None` if nothing has been set
+    /// yet.
+    #[inline]
+    pub fn scissor(&self, num: u32) -> Option<&'a Scissor> {
+        self.current_state.scissor.get(&num)
+    }
+
+    /// Returns the current viewport-with-count settings, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn scissor_with_count(&self) -> Option<&'a [Scissor]> {
+        self.current_state
+            .scissor_with_count
+            .as_ref()
+            .map(|x| x.as_slice())
+    }
+
+    /// Returns the current stencil compare masks.
+    #[inline]
+    pub fn stencil_compare_mask(&self) -> StencilStateDynamic {
+        self.current_state.stencil_compare_mask
+    }
+
+    /// Returns the current stencil ops.
+    #[inline]
+    pub fn stencil_op(&self) -> StencilOpStateDynamic {
+        self.current_state.stencil_op
+    }
+
+    /// Returns the current stencil references.
+    #[inline]
+    pub fn stencil_reference(&self) -> StencilStateDynamic {
+        self.current_state.stencil_reference
+    }
+
+    /// Returns whether stencil testing is enabled, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn stencil_test_enable(&self) -> Option<bool> {
+        self.current_state.stencil_test_enable
+    }
+
+    /// Returns the current stencil write masks.
+    #[inline]
+    pub fn stencil_write_mask(&self) -> StencilStateDynamic {
+        self.current_state.stencil_write_mask
+    }
+
+    /// Returns the current viewport for a given viewport slot, or `None` if nothing has been set
+    /// yet.
+    #[inline]
+    pub fn viewport(&self, num: u32) -> Option<&'a Viewport> {
+        self.current_state.viewport.get(&num)
+    }
+
+    /// Returns the current viewport-with-count settings, or `None` if nothing has been set yet.
+    #[inline]
+    pub fn viewport_with_count(&self) -> Option<&'a [Viewport]> {
+        self.current_state
+            .viewport_with_count
+            .as_ref()
+            .map(|x| x.as_slice())
+    }
+}
+
+/// Holds the current stencil state of a command buffer builder.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StencilStateDynamic {
+    pub front: Option<u32>,
+    pub back: Option<u32>,
+}
+
+/// Holds the current per-face stencil op state of a command buffer builder.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StencilOpStateDynamic {
+    pub front: Option<StencilOps>,
+    pub back: Option<StencilOps>,
 }

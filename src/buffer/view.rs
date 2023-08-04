@@ -15,269 +15,315 @@
 //! In order to create a view from a buffer, the buffer must have been created with either the
 //! `uniform_texel_buffer` or the `storage_texel_buffer` usage.
 //!
-//! # Example
+//! # Examples
 //!
 //! ```
 //! # use std::sync::Arc;
-//! use vulkano::buffer::immutable::ImmutableBuffer;
-//! use vulkano::buffer::BufferUsage;
-//! use vulkano::buffer::BufferView;
+//! use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
+//! use vulkano::buffer::view::{BufferView, BufferViewCreateInfo};
 //! use vulkano::format::Format;
+//! use vulkano::memory::allocator::AllocationCreateInfo;
 //!
-//! # let device: Arc<vulkano::device::Device> = return;
 //! # let queue: Arc<vulkano::device::Queue> = return;
-//! let usage = BufferUsage {
-//!     storage_texel_buffer: true,
-//!     .. BufferUsage::none()
-//! };
+//! # let memory_allocator: vulkano::memory::allocator::StandardMemoryAllocator = return;
+//! let buffer = Buffer::new_slice::<u32>(
+//!     &memory_allocator,
+//!     BufferCreateInfo {
+//!         usage: BufferUsage::STORAGE_TEXEL_BUFFER,
+//!         ..Default::default()
+//!     },
+//!     AllocationCreateInfo::default(),
+//!     128,
+//! )
+//! .unwrap();
 //!
-//! let (buffer, _future) = ImmutableBuffer::<[u32]>::from_iter((0..128).map(|n| n), usage,
-//!                                                             queue.clone()).unwrap();
-//! let _view = BufferView::new(buffer, Format::R32Uint).unwrap();
+//! let view = BufferView::new(
+//!     buffer,
+//!     BufferViewCreateInfo {
+//!         format: Some(Format::R32_UINT),
+//!         ..Default::default()
+//!     },
+//! )
+//! .unwrap();
 //! ```
 
-use crate::buffer::BufferAccess;
-use crate::buffer::BufferInner;
-use crate::buffer::TypedBufferAccess;
-use crate::check_errors;
-use crate::device::Device;
-use crate::device::DeviceOwned;
-use crate::format::Format;
-use crate::format::Pixel;
-use crate::Error;
-use crate::OomError;
-use crate::SafeDeref;
-use crate::VulkanObject;
-use std::error;
-use std::fmt;
-use std::mem::MaybeUninit;
-use std::ptr;
-use std::sync::Arc;
+use super::{BufferUsage, Subbuffer};
+use crate::{
+    device::{Device, DeviceOwned},
+    format::{Format, FormatFeatures},
+    macros::impl_id_counter,
+    memory::{is_aligned, DeviceAlignment},
+    DeviceSize, OomError, RequirementNotMet, RequiresOneOf, Version, VulkanError, VulkanObject,
+};
+use std::{
+    error::Error,
+    fmt::{Display, Error as FmtError, Formatter},
+    mem::MaybeUninit,
+    num::NonZeroU64,
+    ops::Range,
+    ptr,
+    sync::Arc,
+};
 
 /// Represents a way for the GPU to interpret buffer data. See the documentation of the
 /// `view` module.
-pub struct BufferView<B>
-where
-    B: BufferAccess,
-{
-    view: ash::vk::BufferView,
-    buffer: B,
-    atomic_accesses: bool,
+#[derive(Debug)]
+pub struct BufferView {
+    handle: ash::vk::BufferView,
+    subbuffer: Subbuffer<[u8]>,
+    id: NonZeroU64,
+
+    format: Option<Format>,
+    format_features: FormatFeatures,
+    range: Range<DeviceSize>,
 }
 
-impl<B> BufferView<B>
-where
-    B: BufferAccess,
-{
-    /// Builds a new buffer view.
+impl BufferView {
+    /// Creates a new `BufferView`.
     #[inline]
-    pub fn new<Px>(buffer: B, format: Format) -> Result<BufferView<B>, BufferViewCreationError>
-    where
-        B: TypedBufferAccess<Content = [Px]>,
-        Px: Pixel,
-    {
-        unsafe { BufferView::unchecked(buffer, format) }
+    pub fn new(
+        subbuffer: Subbuffer<impl ?Sized>,
+        create_info: BufferViewCreateInfo,
+    ) -> Result<Arc<BufferView>, BufferViewCreationError> {
+        Self::new_inner(subbuffer.into_bytes(), create_info)
     }
 
-    /// Builds a new buffer view without checking that the format is correct.
-    pub unsafe fn unchecked(
-        org_buffer: B,
-        format: Format,
-    ) -> Result<BufferView<B>, BufferViewCreationError>
-    where
-        B: BufferAccess,
-    {
-        let (view, format_props) = {
-            let size = org_buffer.size();
-            let BufferInner { buffer, offset } = org_buffer.inner();
+    fn new_inner(
+        subbuffer: Subbuffer<[u8]>,
+        create_info: BufferViewCreateInfo,
+    ) -> Result<Arc<BufferView>, BufferViewCreationError> {
+        let BufferViewCreateInfo { format, _ne: _ } = create_info;
 
-            let device = buffer.device();
+        let buffer = subbuffer.buffer();
+        let device = buffer.device();
+        let properties = device.physical_device().properties();
+        let size = subbuffer.size();
+        let offset = subbuffer.offset();
 
-            if (offset
-                % device
-                    .physical_device()
-                    .properties()
-                    .min_texel_buffer_offset_alignment)
-                != 0
-            {
-                return Err(BufferViewCreationError::WrongBufferAlignment);
-            }
+        // No VUID, but seems sensible?
+        let format = format.unwrap();
 
-            if !buffer.usage().uniform_texel_buffer && !buffer.usage().storage_texel_buffer {
-                return Err(BufferViewCreationError::WrongBufferUsage);
-            }
+        // VUID-VkBufferViewCreateInfo-format-parameter
+        format.validate_device(device)?;
 
-            {
-                let nb = size
-                    / format
-                        .size()
-                        .expect("Can't use a compressed format for buffer views");
-                let l = device
-                    .physical_device()
-                    .properties()
-                    .max_texel_buffer_elements;
+        // VUID-VkBufferViewCreateInfo-buffer-00932
+        if !buffer
+            .usage()
+            .intersects(BufferUsage::UNIFORM_TEXEL_BUFFER | BufferUsage::STORAGE_TEXEL_BUFFER)
+        {
+            return Err(BufferViewCreationError::BufferMissingUsage);
+        }
 
-                if nb as u32 > l {
-                    return Err(BufferViewCreationError::MaxTexelBufferElementsExceeded);
-                }
-            }
-
-            let format_props = {
-                let fns_i = device.instance().fns();
-                let mut output = MaybeUninit::uninit();
-                fns_i.v1_0.get_physical_device_format_properties(
-                    device.physical_device().internal_object(),
-                    format.into(),
-                    output.as_mut_ptr(),
-                );
-                output.assume_init().buffer_features
-            };
-
-            if buffer.usage().uniform_texel_buffer {
-                if (format_props & ash::vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER).is_empty() {
-                    return Err(BufferViewCreationError::UnsupportedFormat);
-                }
-            }
-
-            if buffer.usage().storage_texel_buffer {
-                if (format_props & ash::vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER).is_empty() {
-                    return Err(BufferViewCreationError::UnsupportedFormat);
-                }
-            }
-
-            let infos = ash::vk::BufferViewCreateInfo {
-                flags: ash::vk::BufferViewCreateFlags::empty(),
-                buffer: buffer.internal_object(),
-                format: format.into(),
-                offset,
-                range: size,
-                ..Default::default()
-            };
-
-            let fns = device.fns();
-            let mut output = MaybeUninit::uninit();
-            check_errors(fns.v1_0.create_buffer_view(
-                device.internal_object(),
-                &infos,
-                ptr::null(),
-                output.as_mut_ptr(),
-            ))?;
-            (output.assume_init(), format_props)
+        // Use unchecked, because all validation has been done above.
+        let format_features = unsafe {
+            device
+                .physical_device()
+                .format_properties_unchecked(format)
+                .buffer_features
         };
 
-        Ok(BufferView {
-            view,
-            buffer: org_buffer,
-            atomic_accesses: !(format_props
-                & ash::vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER_ATOMIC)
-                .is_empty(),
-        })
+        // VUID-VkBufferViewCreateInfo-buffer-00933
+        if buffer.usage().intersects(BufferUsage::UNIFORM_TEXEL_BUFFER)
+            && !format_features.intersects(FormatFeatures::UNIFORM_TEXEL_BUFFER)
+        {
+            return Err(BufferViewCreationError::UnsupportedFormat);
+        }
+
+        // VUID-VkBufferViewCreateInfo-buffer-00934
+        if buffer.usage().intersects(BufferUsage::STORAGE_TEXEL_BUFFER)
+            && !format_features.intersects(FormatFeatures::STORAGE_TEXEL_BUFFER)
+        {
+            return Err(BufferViewCreationError::UnsupportedFormat);
+        }
+
+        let block_size = format.block_size().unwrap();
+        let texels_per_block = format.texels_per_block();
+
+        // VUID-VkBufferViewCreateInfo-range-00929
+        if size % block_size != 0 {
+            return Err(BufferViewCreationError::RangeNotAligned {
+                range: size,
+                required_alignment: block_size,
+            });
+        }
+
+        // VUID-VkBufferViewCreateInfo-range-00930
+        if ((size / block_size) * texels_per_block as DeviceSize) as u32
+            > properties.max_texel_buffer_elements
+        {
+            return Err(BufferViewCreationError::MaxTexelBufferElementsExceeded);
+        }
+
+        if device.api_version() >= Version::V1_3 || device.enabled_features().texel_buffer_alignment
+        {
+            let element_size = DeviceAlignment::new(if block_size % 3 == 0 {
+                block_size / 3
+            } else {
+                block_size
+            })
+            .unwrap();
+
+            if buffer.usage().intersects(BufferUsage::STORAGE_TEXEL_BUFFER) {
+                let mut required_alignment = properties
+                    .storage_texel_buffer_offset_alignment_bytes
+                    .unwrap();
+
+                if properties
+                    .storage_texel_buffer_offset_single_texel_alignment
+                    .unwrap()
+                {
+                    required_alignment = required_alignment.min(element_size);
+                }
+
+                // VUID-VkBufferViewCreateInfo-buffer-02750
+                if !is_aligned(offset, required_alignment) {
+                    return Err(BufferViewCreationError::OffsetNotAligned {
+                        offset,
+                        required_alignment,
+                    });
+                }
+            }
+
+            if buffer.usage().intersects(BufferUsage::UNIFORM_TEXEL_BUFFER) {
+                let mut required_alignment = properties
+                    .uniform_texel_buffer_offset_alignment_bytes
+                    .unwrap();
+
+                if properties
+                    .uniform_texel_buffer_offset_single_texel_alignment
+                    .unwrap()
+                {
+                    required_alignment = required_alignment.min(element_size);
+                }
+
+                // VUID-VkBufferViewCreateInfo-buffer-02751
+                if !is_aligned(offset, required_alignment) {
+                    return Err(BufferViewCreationError::OffsetNotAligned {
+                        offset,
+                        required_alignment,
+                    });
+                }
+            }
+        } else {
+            let required_alignment = properties.min_texel_buffer_offset_alignment;
+
+            // VUID-VkBufferViewCreateInfo-offset-02749
+            if !is_aligned(offset, required_alignment) {
+                return Err(BufferViewCreationError::OffsetNotAligned {
+                    offset,
+                    required_alignment,
+                });
+            }
+        }
+
+        let create_info = ash::vk::BufferViewCreateInfo {
+            flags: ash::vk::BufferViewCreateFlags::empty(),
+            buffer: buffer.handle(),
+            format: format.into(),
+            offset,
+            range: size,
+            ..Default::default()
+        };
+
+        let handle = unsafe {
+            let fns = device.fns();
+            let mut output = MaybeUninit::uninit();
+            (fns.v1_0.create_buffer_view)(
+                device.handle(),
+                &create_info,
+                ptr::null(),
+                output.as_mut_ptr(),
+            )
+            .result()
+            .map_err(VulkanError::from)?;
+            output.assume_init()
+        };
+
+        Ok(Arc::new(BufferView {
+            handle,
+            subbuffer,
+            id: Self::next_id(),
+            format: Some(format),
+            format_features,
+            range: 0..size,
+        }))
     }
 
     /// Returns the buffer associated to this view.
     #[inline]
-    pub fn buffer(&self) -> &B {
-        &self.buffer
+    pub fn buffer(&self) -> &Subbuffer<[u8]> {
+        &self.subbuffer
     }
 
-    /// Returns true if the buffer view can be used as a uniform texel buffer.
+    /// Returns the format of this view.
     #[inline]
-    pub fn uniform_texel_buffer(&self) -> bool {
-        self.buffer.inner().buffer.usage().uniform_texel_buffer
+    pub fn format(&self) -> Option<Format> {
+        self.format
     }
 
-    /// Returns true if the buffer view can be used as a storage texel buffer.
+    /// Returns the features supported by this view’s format.
     #[inline]
-    pub fn storage_texel_buffer(&self) -> bool {
-        self.buffer.inner().buffer.usage().storage_texel_buffer
+    pub fn format_features(&self) -> FormatFeatures {
+        self.format_features
     }
 
-    /// Returns true if the buffer view can be used as a storage texel buffer with atomic accesses.
+    /// Returns the byte range of the wrapped buffer that this view exposes.
     #[inline]
-    pub fn storage_texel_buffer_atomic(&self) -> bool {
-        self.atomic_accesses && self.storage_texel_buffer()
+    pub fn range(&self) -> Range<DeviceSize> {
+        self.range.clone()
     }
 }
 
-unsafe impl<B> VulkanObject for BufferView<B>
-where
-    B: BufferAccess,
-{
-    type Object = ash::vk::BufferView;
-
-    #[inline]
-    fn internal_object(&self) -> ash::vk::BufferView {
-        self.view
-    }
-}
-
-unsafe impl<B> DeviceOwned for BufferView<B>
-where
-    B: BufferAccess,
-{
-    #[inline]
-    fn device(&self) -> &Arc<Device> {
-        self.buffer.device()
-    }
-}
-
-impl<B> fmt::Debug for BufferView<B>
-where
-    B: BufferAccess + fmt::Debug,
-{
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        fmt.debug_struct("BufferView")
-            .field("raw", &self.view)
-            .field("buffer", &self.buffer)
-            .finish()
-    }
-}
-
-impl<B> Drop for BufferView<B>
-where
-    B: BufferAccess,
-{
+impl Drop for BufferView {
     #[inline]
     fn drop(&mut self) {
         unsafe {
-            let fns = self.buffer.inner().buffer.device().fns();
-            fns.v1_0.destroy_buffer_view(
-                self.buffer.inner().buffer.device().internal_object(),
-                self.view,
+            let fns = self.subbuffer.device().fns();
+            (fns.v1_0.destroy_buffer_view)(
+                self.subbuffer.device().handle(),
+                self.handle,
                 ptr::null(),
             );
         }
     }
 }
 
-pub unsafe trait BufferViewRef {
-    type BufferAccess: BufferAccess;
-
-    fn view(&self) -> &BufferView<Self::BufferAccess>;
-}
-
-unsafe impl<B> BufferViewRef for BufferView<B>
-where
-    B: BufferAccess,
-{
-    type BufferAccess = B;
+unsafe impl VulkanObject for BufferView {
+    type Handle = ash::vk::BufferView;
 
     #[inline]
-    fn view(&self) -> &BufferView<B> {
-        self
+    fn handle(&self) -> Self::Handle {
+        self.handle
     }
 }
 
-unsafe impl<T, B> BufferViewRef for T
-where
-    T: SafeDeref<Target = BufferView<B>>,
-    B: BufferAccess,
-{
-    type BufferAccess = B;
-
+unsafe impl DeviceOwned for BufferView {
     #[inline]
-    fn view(&self) -> &BufferView<B> {
-        &**self
+    fn device(&self) -> &Arc<Device> {
+        self.subbuffer.device()
+    }
+}
+
+impl_id_counter!(BufferView);
+
+/// Parameters to create a new `BufferView`.
+#[derive(Clone, Debug)]
+pub struct BufferViewCreateInfo {
+    /// The format of the buffer view.
+    ///
+    /// The default value is `None`, which must be overridden.
+    pub format: Option<Format>,
+
+    pub _ne: crate::NonExhaustive,
+}
+
+impl Default for BufferViewCreateInfo {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            format: None,
+            _ne: crate::NonExhaustive(()),
+        }
     }
 }
 
@@ -287,170 +333,242 @@ pub enum BufferViewCreationError {
     /// Out of memory.
     OomError(OomError),
 
-    /// The buffer was not creating with one of the `storage_texel_buffer` or
-    /// `uniform_texel_buffer` usages.
-    WrongBufferUsage,
+    RequirementNotMet {
+        required_for: &'static str,
+        requires_one_of: RequiresOneOf,
+    },
 
-    /// The offset within the buffer is not a multiple of the `min_texel_buffer_offset_alignment`
-    /// limit.
-    WrongBufferAlignment,
+    /// The buffer was not created with one of the `storage_texel_buffer` or
+    /// `uniform_texel_buffer` usages.
+    BufferMissingUsage,
+
+    /// The offset within the buffer is not a multiple of the required alignment.
+    OffsetNotAligned {
+        offset: DeviceSize,
+        required_alignment: DeviceAlignment,
+    },
+
+    /// The range within the buffer is not a multiple of the required alignment.
+    RangeNotAligned {
+        range: DeviceSize,
+        required_alignment: DeviceSize,
+    },
 
     /// The requested format is not supported for this usage.
     UnsupportedFormat,
 
-    /// The maximum number of elements in the buffer view has been exceeded.
+    /// The `max_texel_buffer_elements` limit has been exceeded.
     MaxTexelBufferElementsExceeded,
 }
 
-impl error::Error for BufferViewCreationError {
-    #[inline]
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
-            BufferViewCreationError::OomError(ref err) => Some(err),
+impl Error for BufferViewCreationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            BufferViewCreationError::OomError(err) => Some(err),
             _ => None,
         }
     }
 }
 
-impl fmt::Display for BufferViewCreationError {
-    #[inline]
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(
-            fmt,
-            "{}",
-            match *self {
-                BufferViewCreationError::OomError(_) => "out of memory when creating buffer view",
-                BufferViewCreationError::WrongBufferUsage => {
-                    "the buffer is missing correct usage flags"
-                }
-                BufferViewCreationError::WrongBufferAlignment => {
-                    "the offset within the buffer is not a multiple of the
-                 `min_texel_buffer_offset_alignment` limit"
-                }
-                BufferViewCreationError::UnsupportedFormat => {
-                    "the requested format is not supported for this usage"
-                }
-                BufferViewCreationError::MaxTexelBufferElementsExceeded => {
-                    "the maximum number of texel elements is exceeded"
-                }
+impl Display for BufferViewCreationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
+        match self {
+            Self::OomError(_) => write!(f, "out of memory when creating buffer view"),
+            Self::RequirementNotMet {
+                required_for,
+                requires_one_of,
+            } => write!(
+                f,
+                "a requirement was not met for: {}; requires one of: {}",
+                required_for, requires_one_of,
+            ),
+            Self::BufferMissingUsage => write!(
+                f,
+                "the buffer was not created with one of the `storage_texel_buffer` or \
+                `uniform_texel_buffer` usages",
+            ),
+            Self::OffsetNotAligned { .. } => write!(
+                f,
+                "the offset within the buffer is not a multiple of the required alignment",
+            ),
+            Self::RangeNotAligned { .. } => write!(
+                f,
+                "the range within the buffer is not a multiple of the required alignment",
+            ),
+            Self::UnsupportedFormat => {
+                write!(f, "the requested format is not supported for this usage")
             }
-        )
+            Self::MaxTexelBufferElementsExceeded => {
+                write!(f, "the `max_texel_buffer_elements` limit has been exceeded")
+            }
+        }
     }
 }
 
 impl From<OomError> for BufferViewCreationError {
-    #[inline]
-    fn from(err: OomError) -> BufferViewCreationError {
-        BufferViewCreationError::OomError(err)
+    fn from(err: OomError) -> Self {
+        Self::OomError(err)
     }
 }
 
-impl From<Error> for BufferViewCreationError {
-    #[inline]
-    fn from(err: Error) -> BufferViewCreationError {
+impl From<VulkanError> for BufferViewCreationError {
+    fn from(err: VulkanError) -> Self {
         OomError::from(err).into()
+    }
+}
+
+impl From<RequirementNotMet> for BufferViewCreationError {
+    fn from(err: RequirementNotMet) -> Self {
+        Self::RequirementNotMet {
+            required_for: err.required_for,
+            requires_one_of: err.requires_one_of,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::buffer::immutable::ImmutableBuffer;
-    use crate::buffer::view::BufferViewCreationError;
-    use crate::buffer::BufferUsage;
-    use crate::buffer::BufferView;
-    use crate::format::Format;
+    use super::{BufferView, BufferViewCreateInfo, BufferViewCreationError};
+    use crate::{
+        buffer::{Buffer, BufferCreateInfo, BufferUsage},
+        format::Format,
+        memory::allocator::{AllocationCreateInfo, MemoryUsage, StandardMemoryAllocator},
+    };
 
     #[test]
     fn create_uniform() {
         // `VK_FORMAT_R8G8B8A8_UNORM` guaranteed to be a supported format
-        let (device, queue) = gfx_dev_and_queue!();
+        let (device, _) = gfx_dev_and_queue!();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
 
-        let usage = BufferUsage {
-            uniform_texel_buffer: true,
-            ..BufferUsage::none()
-        };
-
-        let (buffer, _) =
-            ImmutableBuffer::<[[u8; 4]]>::from_iter((0..128).map(|_| [0; 4]), usage, queue.clone())
-                .unwrap();
-        let view = BufferView::new(buffer, Format::R8G8B8A8Unorm).unwrap();
-
-        assert!(view.uniform_texel_buffer());
+        let buffer = Buffer::new_slice::<[u8; 4]>(
+            &memory_allocator,
+            BufferCreateInfo {
+                usage: BufferUsage::UNIFORM_TEXEL_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                usage: MemoryUsage::Upload,
+                ..Default::default()
+            },
+            128,
+        )
+        .unwrap();
+        BufferView::new(
+            buffer,
+            BufferViewCreateInfo {
+                format: Some(Format::R8G8B8A8_UNORM),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     #[test]
     fn create_storage() {
         // `VK_FORMAT_R8G8B8A8_UNORM` guaranteed to be a supported format
-        let (device, queue) = gfx_dev_and_queue!();
+        let (device, _) = gfx_dev_and_queue!();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
 
-        let usage = BufferUsage {
-            storage_texel_buffer: true,
-            ..BufferUsage::none()
-        };
-
-        let (buffer, _) =
-            ImmutableBuffer::<[[u8; 4]]>::from_iter((0..128).map(|_| [0; 4]), usage, queue.clone())
-                .unwrap();
-        let view = BufferView::new(buffer, Format::R8G8B8A8Unorm).unwrap();
-
-        assert!(view.storage_texel_buffer());
+        let buffer = Buffer::new_slice::<[u8; 4]>(
+            &memory_allocator,
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_TEXEL_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+            128,
+        )
+        .unwrap();
+        BufferView::new(
+            buffer,
+            BufferViewCreateInfo {
+                format: Some(Format::R8G8B8A8_UNORM),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     #[test]
     fn create_storage_atomic() {
         // `VK_FORMAT_R32_UINT` guaranteed to be a supported format for atomics
-        let (device, queue) = gfx_dev_and_queue!();
+        let (device, _) = gfx_dev_and_queue!();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
 
-        let usage = BufferUsage {
-            storage_texel_buffer: true,
-            ..BufferUsage::none()
-        };
-
-        let (buffer, _) =
-            ImmutableBuffer::<[u32]>::from_iter((0..128).map(|_| 0), usage, queue.clone()).unwrap();
-        let view = BufferView::new(buffer, Format::R32Uint).unwrap();
-
-        assert!(view.storage_texel_buffer());
-        assert!(view.storage_texel_buffer_atomic());
+        let buffer = Buffer::new_slice::<u32>(
+            &memory_allocator,
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_TEXEL_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+            128,
+        )
+        .unwrap();
+        BufferView::new(
+            buffer,
+            BufferViewCreateInfo {
+                format: Some(Format::R32_UINT),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     #[test]
     fn wrong_usage() {
         // `VK_FORMAT_R8G8B8A8_UNORM` guaranteed to be a supported format
-        let (device, queue) = gfx_dev_and_queue!();
+        let (device, _) = gfx_dev_and_queue!();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
 
-        let (buffer, _) = ImmutableBuffer::<[[u8; 4]]>::from_iter(
-            (0..128).map(|_| [0; 4]),
-            BufferUsage::none(),
-            queue.clone(),
+        let buffer = Buffer::new_slice::<[u8; 4]>(
+            &memory_allocator,
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_DST, // Dummy value
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+            128,
         )
         .unwrap();
 
-        match BufferView::new(buffer, Format::R8G8B8A8Unorm) {
-            Err(BufferViewCreationError::WrongBufferUsage) => (),
+        match BufferView::new(
+            buffer,
+            BufferViewCreateInfo {
+                format: Some(Format::R8G8B8A8_UNORM),
+                ..Default::default()
+            },
+        ) {
+            Err(BufferViewCreationError::BufferMissingUsage) => (),
             _ => panic!(),
         }
     }
 
     #[test]
     fn unsupported_format() {
-        let (device, queue) = gfx_dev_and_queue!();
+        let (device, _) = gfx_dev_and_queue!();
+        let memory_allocator = StandardMemoryAllocator::new_default(device);
 
-        let usage = BufferUsage {
-            uniform_texel_buffer: true,
-            storage_texel_buffer: true,
-            ..BufferUsage::none()
-        };
-
-        let (buffer, _) = ImmutableBuffer::<[[f64; 4]]>::from_iter(
-            (0..128).map(|_| [0.0; 4]),
-            usage,
-            queue.clone(),
+        let buffer = Buffer::new_slice::<[f64; 4]>(
+            &memory_allocator,
+            BufferCreateInfo {
+                usage: BufferUsage::UNIFORM_TEXEL_BUFFER | BufferUsage::STORAGE_TEXEL_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+            128,
         )
         .unwrap();
 
-        // TODO: what if R64G64B64A64Sfloat is supported?
-        match BufferView::new(buffer, Format::R64G64B64A64Sfloat) {
+        // TODO: what if R64G64B64A64_SFLOAT is supported?
+        match BufferView::new(
+            buffer,
+            BufferViewCreateInfo {
+                format: Some(Format::R64G64B64A64_SFLOAT),
+                ..Default::default()
+            },
+        ) {
             Err(BufferViewCreationError::UnsupportedFormat) => (),
             _ => panic!(),
         }
