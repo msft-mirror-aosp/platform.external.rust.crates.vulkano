@@ -41,7 +41,18 @@ genrule {
     name: "copy_vulkano_build_out",
     srcs: ["out/*"],
     cmd: "cp $(in) $(genDir)",
-    out: ["autogen.rs"],
+    out: [
+        "device_extensions.rs",
+        "errors.rs",
+        "features.rs",
+        "fns.rs",
+        "formats.rs",
+        "instance_extensions.rs",
+        "properties.rs",
+        "spirv_parse.rs",
+        "spirv_reqs.rs",
+        "version.rs",
+    ],
 }
 
 rust_library {
@@ -50,21 +61,23 @@ rust_library {
     host_supported: true,
     crate_name: "vulkano",
     cargo_env_compat: true,
-    cargo_pkg_version: "0.25.0",
+    cargo_pkg_version: "0.33.0",
     srcs: [
         "src/lib.rs",
         ":copy_vulkano_build_out",
     ],
-    edition: "2018",
+    edition: "2021",
     rustlibs: [
+        "libahash",
         "libash_rust",
+        "libbytemuck",
         "libcrossbeam_queue",
-        "libfnv",
         "libhalf",
-        "liblazy_static",
+        "liblibloading",
+        "libonce_cell",
         "libparking_lot",
-        "libshared_library",
         "libsmallvec",
+        "libthread_local",
     ],
     apex_available: [
         "//apex_available:platform",
@@ -72,33 +85,4 @@ rust_library {
     ],
     product_available: true,
     vendor_available: true,
-}
-
-rust_test {
-    name: "vulkano_test_src_lib",
-    // has rustc warnings
-    host_supported: true,
-    crate_name: "vulkano",
-    cargo_env_compat: true,
-    cargo_pkg_version: "0.25.0",
-    srcs: [
-        "src/lib.rs",
-        ":copy_vulkano_build_out",
-    ],
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-    test_options: {
-        unit_test: false,
-    },
-    edition: "2018",
-    rustlibs: [
-        "libash_rust",
-        "libcrossbeam_queue",
-        "libfnv",
-        "libhalf",
-        "liblazy_static",
-        "libparking_lot",
-        "libshared_library",
-        "libsmallvec",
-    ],
 }

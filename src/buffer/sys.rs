@@ -9,293 +9,573 @@
 
 //! Low level implementation of buffers.
 //!
-//! Wraps directly around Vulkan buffers, with the exceptions of a few safety checks.
-//!
-//! The `UnsafeBuffer` type is the lowest-level buffer object provided by this library. It is used
-//! internally by the higher-level buffer types. You are strongly encouraged to have excellent
-//! knowledge of the Vulkan specs if you want to use an `UnsafeBuffer`.
-//!
-//! Here is what you must take care of when you use an `UnsafeBuffer`:
-//!
-//! - Synchronization, ie. avoid reading and writing simultaneously to the same buffer.
-//! - Memory aliasing considerations. If you use the same memory to back multiple resources, you
-//!   must ensure that they are not used together and must enable some additional flags.
-//! - Binding memory correctly and only once. If you use sparse binding, respect the rules of
-//!   sparse binding.
-//! - Type safety.
+//! This module contains low-level wrappers around the Vulkan buffer types. All
+//! other buffer types of this library, and all custom buffer types
+//! that you create must wrap around the types in this module.
 
-use crate::check_errors;
-use crate::device::Device;
-use crate::device::DeviceOwned;
-use crate::memory::DeviceMemory;
-use crate::memory::DeviceMemoryAllocError;
-use crate::memory::MemoryRequirements;
-use crate::sync::Sharing;
-use crate::DeviceSize;
-use crate::Error;
-use crate::OomError;
-use crate::VulkanObject;
-use crate::{buffer::BufferUsage, Version};
-use ash::vk::Handle;
+use super::{Buffer, BufferCreateFlags, BufferError, BufferMemory, BufferUsage};
+use crate::{
+    device::{Device, DeviceOwned},
+    macros::impl_id_counter,
+    memory::{
+        allocator::{AllocationType, DeviceLayout, MemoryAlloc},
+        is_aligned, DedicatedTo, ExternalMemoryHandleTypes, MemoryAllocateFlags,
+        MemoryPropertyFlags, MemoryRequirements,
+    },
+    sync::Sharing,
+    DeviceSize, RequiresOneOf, Version, VulkanError, VulkanObject,
+};
 use smallvec::SmallVec;
-use std::error;
-use std::fmt;
-use std::hash::Hash;
-use std::hash::Hasher;
-use std::mem::MaybeUninit;
-use std::ptr;
-use std::sync::Arc;
+use std::{mem::MaybeUninit, num::NonZeroU64, ptr, sync::Arc};
 
-/// Data storage in a GPU-accessible location.
-pub struct UnsafeBuffer {
-    buffer: ash::vk::Buffer,
+/// A raw buffer, with no memory backing it.
+///
+/// This is the basic buffer type, a direct translation of a `VkBuffer` object, but it is mostly
+/// useless in this form. After creating a raw buffer, you must call `bind_memory` to make a
+/// complete buffer object.
+#[derive(Debug)]
+pub struct RawBuffer {
+    handle: ash::vk::Buffer,
     device: Arc<Device>,
+    id: NonZeroU64,
+
+    flags: BufferCreateFlags,
     size: DeviceSize,
     usage: BufferUsage,
+    sharing: Sharing<SmallVec<[u32; 4]>>,
+    external_memory_handle_types: ExternalMemoryHandleTypes,
+
+    memory_requirements: MemoryRequirements,
 }
 
-impl UnsafeBuffer {
-    /// Creates a new buffer of the given size.
+impl RawBuffer {
+    /// Creates a new `RawBuffer`.
     ///
-    /// See the module's documentation for information about safety.
+    /// # Panics
     ///
-    /// # Panic
-    ///
-    /// - Panics if `sparse.sparse` is false and `sparse.sparse_residency` or `sparse.sparse_aliased` is true.
-    /// - Panics if `usage` is empty.
-    ///
-    pub unsafe fn new<'a, I>(
+    /// - Panics if `create_info.sharing` is [`Concurrent`](Sharing::Concurrent) with less than 2
+    ///   items.
+    /// - Panics if `create_info.size` is zero.
+    /// - Panics if `create_info.usage` is empty.
+    #[inline]
+    pub fn new(
         device: Arc<Device>,
-        size: DeviceSize,
-        mut usage: BufferUsage,
-        sharing: Sharing<I>,
-        sparse: Option<SparseLevel>,
-    ) -> Result<(UnsafeBuffer, MemoryRequirements), BufferCreationError>
-    where
-        I: Iterator<Item = u32>,
-    {
-        let fns = device.fns();
-
-        // Ensure we're not trying to create an empty buffer.
-        let size = if size == 0 {
-            // To avoid panicking when allocating 0 bytes, use a 1-byte buffer.
-            1
-        } else {
-            size
-        };
-
-        // Checking sparse features.
-        let flags = if let Some(sparse_level) = sparse {
-            if !device.enabled_features().sparse_binding {
-                return Err(BufferCreationError::SparseBindingFeatureNotEnabled);
-            }
-
-            if sparse_level.sparse_residency && !device.enabled_features().sparse_residency_buffer {
-                return Err(BufferCreationError::SparseResidencyBufferFeatureNotEnabled);
-            }
-
-            if sparse_level.sparse_aliased && !device.enabled_features().sparse_residency_aliased {
-                return Err(BufferCreationError::SparseResidencyAliasedFeatureNotEnabled);
-            }
-
-            sparse_level.into()
-        } else {
-            ash::vk::BufferCreateFlags::empty()
-        };
-
-        if usage.device_address && !device.enabled_features().buffer_device_address {
-            usage.device_address = false;
-            if ash::vk::BufferUsageFlags::from(usage).is_empty() {
-                // return an error iff device_address was the only requested usage and the
-                // feature isn't enabled. Otherwise we'll hit that assert below.
-                // TODO: This is weird, why not just return an error always if the feature is not enabled?
-                // You can't use BufferUsage::all() anymore, but is that a good idea anyway?
-                return Err(BufferCreationError::DeviceAddressFeatureNotEnabled);
+        mut create_info: BufferCreateInfo,
+    ) -> Result<Self, BufferError> {
+        match &mut create_info.sharing {
+            Sharing::Exclusive => (),
+            Sharing::Concurrent(queue_family_indices) => {
+                // VUID-VkBufferCreateInfo-sharingMode-01419
+                queue_family_indices.sort_unstable();
+                queue_family_indices.dedup();
             }
         }
 
-        let usage_bits = ash::vk::BufferUsageFlags::from(usage);
-        // Checking for empty BufferUsage.
-        assert!(
-            !usage_bits.is_empty(),
-            "Can't create buffer with empty BufferUsage"
-        );
+        Self::validate_new(&device, &create_info)?;
 
-        let buffer = {
-            let (sh_mode, sh_indices) = match sharing {
-                Sharing::Exclusive => {
-                    (ash::vk::SharingMode::EXCLUSIVE, SmallVec::<[u32; 8]>::new())
+        unsafe { Ok(Self::new_unchecked(device, create_info)?) }
+    }
+
+    fn validate_new(device: &Device, create_info: &BufferCreateInfo) -> Result<(), BufferError> {
+        let &BufferCreateInfo {
+            flags,
+            ref sharing,
+            size,
+            usage,
+            external_memory_handle_types,
+            _ne: _,
+        } = create_info;
+
+        // VUID-VkBufferCreateInfo-flags-parameter
+        flags.validate_device(device)?;
+
+        // VUID-VkBufferCreateInfo-usage-parameter
+        usage.validate_device(device)?;
+
+        // VUID-VkBufferCreateInfo-usage-requiredbitmask
+        assert!(!usage.is_empty());
+
+        // VUID-VkBufferCreateInfo-size-00912
+        assert!(size != 0);
+
+        /* Enable when sparse binding is properly handled
+        if let Some(sparse_level) = sparse {
+            // VUID-VkBufferCreateInfo-flags-00915
+            if !device.enabled_features().sparse_binding {
+                return Err(BufferError::RequirementNotMet {
+                    required_for: "`create_info.sparse` is `Some`",
+                    requires_one_of: RequiresOneOf {
+                        features: &["sparse_binding"],
+                        ..Default::default()
+                    },
+                });
+            }
+
+            // VUID-VkBufferCreateInfo-flags-00916
+            if sparse_level.sparse_residency && !device.enabled_features().sparse_residency_buffer {
+                return Err(BufferError::RequirementNotMet {
+                    required_for: "`create_info.sparse` is `Some(sparse_level)`, where \
+                        `sparse_level` contains `BufferCreateFlags::SPARSE_RESIDENCY`",
+                    requires_one_of: RequiresOneOf {
+                        features: &["sparse_residency_buffer"],
+                        ..Default::default()
+                    },
+                });
+            }
+
+            // VUID-VkBufferCreateInfo-flags-00917
+            if sparse_level.sparse_aliased && !device.enabled_features().sparse_residency_aliased {
+                return Err(BufferError::RequirementNotMet {
+                    required_for: "`create_info.sparse` is `Some(sparse_level)`, where \
+                        `sparse_level` contains `BufferCreateFlags::SPARSE_ALIASED`",
+                    requires_one_of: RequiresOneOf {
+                        features: &["sparse_residency_aliased"],
+                        ..Default::default()
+                    },
+                });
+            }
+
+            // VUID-VkBufferCreateInfo-flags-00918
+        }
+        */
+
+        match sharing {
+            Sharing::Exclusive => (),
+            Sharing::Concurrent(queue_family_indices) => {
+                // VUID-VkBufferCreateInfo-sharingMode-00914
+                assert!(queue_family_indices.len() >= 2);
+
+                for &queue_family_index in queue_family_indices.iter() {
+                    // VUID-VkBufferCreateInfo-sharingMode-01419
+                    if queue_family_index
+                        >= device.physical_device().queue_family_properties().len() as u32
+                    {
+                        return Err(BufferError::SharingQueueFamilyIndexOutOfRange {
+                            queue_family_index,
+                            queue_family_count: device
+                                .physical_device()
+                                .queue_family_properties()
+                                .len() as u32,
+                        });
+                    }
                 }
-                Sharing::Concurrent(ids) => (ash::vk::SharingMode::CONCURRENT, ids.collect()),
-            };
+            }
+        }
 
-            let infos = ash::vk::BufferCreateInfo {
-                flags,
-                size,
-                usage: usage_bits,
-                sharing_mode: sh_mode,
-                queue_family_index_count: sh_indices.len() as u32,
-                p_queue_family_indices: sh_indices.as_ptr(),
+        if let Some(max_buffer_size) = device.physical_device().properties().max_buffer_size {
+            // VUID-VkBufferCreateInfo-size-06409
+            if size > max_buffer_size {
+                return Err(BufferError::MaxBufferSizeExceeded {
+                    size,
+                    max: max_buffer_size,
+                });
+            }
+        }
+
+        if !external_memory_handle_types.is_empty() {
+            if !(device.api_version() >= Version::V1_1
+                || device.enabled_extensions().khr_external_memory)
+            {
+                return Err(BufferError::RequirementNotMet {
+                    required_for: "`create_info.external_memory_handle_types` is not empty",
+                    requires_one_of: RequiresOneOf {
+                        api_version: Some(Version::V1_1),
+                        device_extensions: &["khr_external_memory"],
+                        ..Default::default()
+                    },
+                });
+            }
+
+            // VUID-VkExternalMemoryBufferCreateInfo-handleTypes-parameter
+            external_memory_handle_types.validate_device(device)?;
+
+            // VUID-VkBufferCreateInfo-pNext-00920
+            // TODO:
+        }
+
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "document_unchecked"), doc(hidden))]
+    pub unsafe fn new_unchecked(
+        device: Arc<Device>,
+        create_info: BufferCreateInfo,
+    ) -> Result<Self, VulkanError> {
+        let &BufferCreateInfo {
+            flags,
+            ref sharing,
+            size,
+            usage,
+            external_memory_handle_types,
+            _ne: _,
+        } = &create_info;
+
+        let (sharing_mode, queue_family_index_count, p_queue_family_indices) = match sharing {
+            Sharing::Exclusive => (ash::vk::SharingMode::EXCLUSIVE, 0, &[] as _),
+            Sharing::Concurrent(queue_family_indices) => (
+                ash::vk::SharingMode::CONCURRENT,
+                queue_family_indices.len() as u32,
+                queue_family_indices.as_ptr(),
+            ),
+        };
+
+        let mut create_info_vk = ash::vk::BufferCreateInfo {
+            flags: flags.into(),
+            size,
+            usage: usage.into(),
+            sharing_mode,
+            queue_family_index_count,
+            p_queue_family_indices,
+            ..Default::default()
+        };
+        let mut external_memory_info_vk = None;
+
+        if !external_memory_handle_types.is_empty() {
+            let _ = external_memory_info_vk.insert(ash::vk::ExternalMemoryBufferCreateInfo {
+                handle_types: external_memory_handle_types.into(),
                 ..Default::default()
-            };
+            });
+        }
 
+        if let Some(next) = external_memory_info_vk.as_mut() {
+            next.p_next = create_info_vk.p_next;
+            create_info_vk.p_next = next as *const _ as *const _;
+        }
+
+        let handle = {
+            let fns = device.fns();
             let mut output = MaybeUninit::uninit();
-            check_errors(fns.v1_0.create_buffer(
-                device.internal_object(),
-                &infos,
+            (fns.v1_0.create_buffer)(
+                device.handle(),
+                &create_info_vk,
                 ptr::null(),
                 output.as_mut_ptr(),
-            ))?;
+            )
+            .result()
+            .map_err(VulkanError::from)?;
             output.assume_init()
         };
 
-        let mem_reqs = {
-            #[inline]
-            fn align(val: DeviceSize, al: DeviceSize) -> DeviceSize {
-                al * (1 + (val - 1) / al)
-            }
-
-            let mut output = if device.api_version() >= Version::V1_1
-                || device.enabled_extensions().khr_get_memory_requirements2
-            {
-                let infos = ash::vk::BufferMemoryRequirementsInfo2 {
-                    buffer: buffer,
-                    ..Default::default()
-                };
-
-                let mut output2 = if device.api_version() >= Version::V1_1
-                    || device.enabled_extensions().khr_dedicated_allocation
-                {
-                    Some(ash::vk::MemoryDedicatedRequirementsKHR::default())
-                } else {
-                    None
-                };
-
-                let mut output = ash::vk::MemoryRequirements2 {
-                    p_next: output2
-                        .as_mut()
-                        .map(|o| o as *mut ash::vk::MemoryDedicatedRequirementsKHR)
-                        .unwrap_or(ptr::null_mut()) as *mut _,
-                    ..Default::default()
-                };
-
-                if device.api_version() >= Version::V1_1 {
-                    fns.v1_1.get_buffer_memory_requirements2(
-                        device.internal_object(),
-                        &infos,
-                        &mut output,
-                    );
-                } else {
-                    fns.khr_get_memory_requirements2
-                        .get_buffer_memory_requirements2_khr(
-                            device.internal_object(),
-                            &infos,
-                            &mut output,
-                        );
-                }
-
-                debug_assert!(output.memory_requirements.size >= size);
-                debug_assert!(output.memory_requirements.memory_type_bits != 0);
-
-                let mut out = MemoryRequirements::from(output.memory_requirements);
-                if let Some(output2) = output2 {
-                    debug_assert_eq!(output2.requires_dedicated_allocation, 0);
-                    out.prefer_dedicated = output2.prefers_dedicated_allocation != 0;
-                }
-                out
-            } else {
-                let mut output: MaybeUninit<ash::vk::MemoryRequirements> = MaybeUninit::uninit();
-                fns.v1_0.get_buffer_memory_requirements(
-                    device.internal_object(),
-                    buffer,
-                    output.as_mut_ptr(),
-                );
-                let output = output.assume_init();
-                debug_assert!(output.size >= size);
-                debug_assert!(output.memory_type_bits != 0);
-                MemoryRequirements::from(output)
-            };
-
-            // We have to manually enforce some additional requirements for some buffer types.
-            let properties = device.physical_device().properties();
-            if usage.uniform_texel_buffer || usage.storage_texel_buffer {
-                output.alignment = align(
-                    output.alignment,
-                    properties.min_texel_buffer_offset_alignment,
-                );
-            }
-
-            if usage.storage_buffer {
-                output.alignment = align(
-                    output.alignment,
-                    properties.min_storage_buffer_offset_alignment,
-                );
-            }
-
-            if usage.uniform_buffer {
-                output.alignment = align(
-                    output.alignment,
-                    properties.min_uniform_buffer_offset_alignment,
-                );
-            }
-
-            output
-        };
-
-        let obj = UnsafeBuffer {
-            buffer,
-            device: device.clone(),
-            size,
-            usage,
-        };
-
-        Ok((obj, mem_reqs))
+        Ok(Self::from_handle(device, handle, create_info))
     }
 
-    /// Binds device memory to this buffer.
-    pub unsafe fn bind_memory(
-        &self,
-        memory: &DeviceMemory,
-        offset: DeviceSize,
-    ) -> Result<(), OomError> {
-        let fns = self.device.fns();
+    /// Creates a new `RawBuffer` from a raw object handle.
+    ///
+    /// # Safety
+    ///
+    /// - `handle` must be a valid Vulkan object handle created from `device`.
+    /// - `handle` must refer to a buffer that has not yet had memory bound to it.
+    /// - `create_info` must match the info used to create the object.
+    #[inline]
+    pub unsafe fn from_handle(
+        device: Arc<Device>,
+        handle: ash::vk::Buffer,
+        create_info: BufferCreateInfo,
+    ) -> Self {
+        let BufferCreateInfo {
+            flags,
+            size,
+            usage,
+            sharing,
+            external_memory_handle_types,
+            _ne: _,
+        } = create_info;
 
-        // We check for correctness in debug mode.
-        debug_assert!({
-            let mut mem_reqs = MaybeUninit::uninit();
-            fns.v1_0.get_buffer_memory_requirements(
-                self.device.internal_object(),
-                self.buffer,
-                mem_reqs.as_mut_ptr(),
+        let mut memory_requirements = Self::get_memory_requirements(&device, handle);
+
+        debug_assert!(memory_requirements.layout.size() >= size);
+        debug_assert!(memory_requirements.memory_type_bits != 0);
+
+        // We have to manually enforce some additional requirements for some buffer types.
+        let properties = device.physical_device().properties();
+        if usage.intersects(BufferUsage::UNIFORM_TEXEL_BUFFER | BufferUsage::STORAGE_TEXEL_BUFFER) {
+            memory_requirements.layout = memory_requirements
+                .layout
+                .align_to(properties.min_texel_buffer_offset_alignment)
+                .unwrap();
+        }
+
+        if usage.intersects(BufferUsage::STORAGE_BUFFER) {
+            memory_requirements.layout = memory_requirements
+                .layout
+                .align_to(properties.min_storage_buffer_offset_alignment)
+                .unwrap();
+        }
+
+        if usage.intersects(BufferUsage::UNIFORM_BUFFER) {
+            memory_requirements.layout = memory_requirements
+                .layout
+                .align_to(properties.min_uniform_buffer_offset_alignment)
+                .unwrap();
+        }
+
+        RawBuffer {
+            handle,
+            device,
+            id: Self::next_id(),
+            flags,
+            size,
+            usage,
+            sharing,
+            external_memory_handle_types,
+            memory_requirements,
+        }
+    }
+
+    fn get_memory_requirements(device: &Device, handle: ash::vk::Buffer) -> MemoryRequirements {
+        let info_vk = ash::vk::BufferMemoryRequirementsInfo2 {
+            buffer: handle,
+            ..Default::default()
+        };
+
+        let mut memory_requirements2_vk = ash::vk::MemoryRequirements2::default();
+        let mut memory_dedicated_requirements_vk = None;
+
+        if device.api_version() >= Version::V1_1
+            || device.enabled_extensions().khr_dedicated_allocation
+        {
+            debug_assert!(
+                device.api_version() >= Version::V1_1
+                    || device.enabled_extensions().khr_get_memory_requirements2
             );
 
-            let mem_reqs = mem_reqs.assume_init();
-            mem_reqs.size <= (memory.size() - offset)
-                && (offset % mem_reqs.alignment) == 0
-                && mem_reqs.memory_type_bits & (1 << memory.memory_type().id()) != 0
-        });
+            let next = memory_dedicated_requirements_vk
+                .insert(ash::vk::MemoryDedicatedRequirements::default());
 
-        // Check for alignment correctness.
-        {
-            let properties = self.device().physical_device().properties();
-            if self.usage().uniform_texel_buffer || self.usage().storage_texel_buffer {
-                debug_assert!(offset % properties.min_texel_buffer_offset_alignment == 0);
-            }
-            if self.usage().storage_buffer {
-                debug_assert!(offset % properties.min_storage_buffer_offset_alignment == 0);
-            }
-            if self.usage().uniform_buffer {
-                debug_assert!(offset % properties.min_uniform_buffer_offset_alignment == 0);
+            next.p_next = memory_requirements2_vk.p_next;
+            memory_requirements2_vk.p_next = next as *mut _ as *mut _;
+        }
+
+        unsafe {
+            let fns = device.fns();
+
+            if device.api_version() >= Version::V1_1
+                || device.enabled_extensions().khr_get_memory_requirements2
+            {
+                if device.api_version() >= Version::V1_1 {
+                    (fns.v1_1.get_buffer_memory_requirements2)(
+                        device.handle(),
+                        &info_vk,
+                        &mut memory_requirements2_vk,
+                    );
+                } else {
+                    (fns.khr_get_memory_requirements2
+                        .get_buffer_memory_requirements2_khr)(
+                        device.handle(),
+                        &info_vk,
+                        &mut memory_requirements2_vk,
+                    );
+                }
+            } else {
+                (fns.v1_0.get_buffer_memory_requirements)(
+                    device.handle(),
+                    handle,
+                    &mut memory_requirements2_vk.memory_requirements,
+                );
             }
         }
 
-        check_errors(fns.v1_0.bind_buffer_memory(
-            self.device.internal_object(),
-            self.buffer,
-            memory.internal_object(),
-            offset,
-        ))?;
+        MemoryRequirements {
+            layout: DeviceLayout::from_size_alignment(
+                memory_requirements2_vk.memory_requirements.size,
+                memory_requirements2_vk.memory_requirements.alignment,
+            )
+            .unwrap(),
+            memory_type_bits: memory_requirements2_vk.memory_requirements.memory_type_bits,
+            prefers_dedicated_allocation: memory_dedicated_requirements_vk
+                .map_or(false, |dreqs| dreqs.prefers_dedicated_allocation != 0),
+            requires_dedicated_allocation: memory_dedicated_requirements_vk
+                .map_or(false, |dreqs| dreqs.requires_dedicated_allocation != 0),
+        }
+    }
+
+    pub(crate) fn id(&self) -> NonZeroU64 {
+        self.id
+    }
+
+    /// Binds device memory to this buffer.
+    pub fn bind_memory(
+        self,
+        allocation: MemoryAlloc,
+    ) -> Result<Buffer, (BufferError, RawBuffer, MemoryAlloc)> {
+        if let Err(err) = self.validate_bind_memory(&allocation) {
+            return Err((err, self, allocation));
+        }
+
+        unsafe { self.bind_memory_unchecked(allocation) }
+            .map_err(|(err, buffer, allocation)| (err.into(), buffer, allocation))
+    }
+
+    fn validate_bind_memory(&self, allocation: &MemoryAlloc) -> Result<(), BufferError> {
+        assert_ne!(allocation.allocation_type(), AllocationType::NonLinear);
+
+        let memory_requirements = &self.memory_requirements;
+        let memory = allocation.device_memory();
+        let memory_offset = allocation.offset();
+        let memory_type = &self
+            .device
+            .physical_device()
+            .memory_properties()
+            .memory_types[memory.memory_type_index() as usize];
+
+        // VUID-VkBindBufferMemoryInfo-commonparent
+        assert_eq!(self.device(), memory.device());
+
+        // VUID-VkBindBufferMemoryInfo-buffer-07459
+        // Ensured by taking ownership of `RawBuffer`.
+
+        // VUID-VkBindBufferMemoryInfo-buffer-01030
+        // Currently ensured by not having sparse binding flags, but this needs to be checked once
+        // those are enabled.
+
+        // VUID-VkBindBufferMemoryInfo-memoryOffset-01031
+        // Assume that `allocation` was created correctly.
+
+        // VUID-VkBindBufferMemoryInfo-memory-01035
+        if memory_requirements.memory_type_bits & (1 << memory.memory_type_index()) == 0 {
+            return Err(BufferError::MemoryTypeNotAllowed {
+                provided_memory_type_index: memory.memory_type_index(),
+                allowed_memory_type_bits: memory_requirements.memory_type_bits,
+            });
+        }
+
+        // VUID-VkBindBufferMemoryInfo-memoryOffset-01036
+        if !is_aligned(memory_offset, memory_requirements.layout.alignment()) {
+            return Err(BufferError::MemoryAllocationNotAligned {
+                allocation_offset: memory_offset,
+                required_alignment: memory_requirements.layout.alignment(),
+            });
+        }
+
+        // VUID-VkBindBufferMemoryInfo-size-01037
+        if allocation.size() < memory_requirements.layout.size() {
+            return Err(BufferError::MemoryAllocationTooSmall {
+                allocation_size: allocation.size(),
+                required_size: memory_requirements.layout.size(),
+            });
+        }
+
+        if let Some(dedicated_to) = memory.dedicated_to() {
+            // VUID-VkBindBufferMemoryInfo-memory-01508
+            match dedicated_to {
+                DedicatedTo::Buffer(id) if id == self.id => {}
+                _ => return Err(BufferError::DedicatedAllocationMismatch),
+            }
+            debug_assert!(memory_offset == 0); // This should be ensured by the allocator
+        } else {
+            // VUID-VkBindBufferMemoryInfo-buffer-01444
+            if memory_requirements.requires_dedicated_allocation {
+                return Err(BufferError::DedicatedAllocationRequired);
+            }
+        }
+
+        // VUID-VkBindBufferMemoryInfo-None-01899
+        if memory_type
+            .property_flags
+            .intersects(MemoryPropertyFlags::PROTECTED)
+        {
+            return Err(BufferError::MemoryProtectedMismatch {
+                buffer_protected: false,
+                memory_protected: true,
+            });
+        }
+
+        // VUID-VkBindBufferMemoryInfo-memory-02726
+        if !memory.export_handle_types().is_empty()
+            && !memory
+                .export_handle_types()
+                .intersects(self.external_memory_handle_types)
+        {
+            return Err(BufferError::MemoryExternalHandleTypesDisjoint {
+                buffer_handle_types: self.external_memory_handle_types,
+                memory_export_handle_types: memory.export_handle_types(),
+            });
+        }
+
+        if let Some(handle_type) = memory.imported_handle_type() {
+            // VUID-VkBindBufferMemoryInfo-memory-02985
+            if !ExternalMemoryHandleTypes::from(handle_type)
+                .intersects(self.external_memory_handle_types)
+            {
+                return Err(BufferError::MemoryImportedHandleTypeNotEnabled {
+                    buffer_handle_types: self.external_memory_handle_types,
+                    memory_imported_handle_type: handle_type,
+                });
+            }
+        }
+
+        // VUID-VkBindBufferMemoryInfo-bufferDeviceAddress-03339
+        if !self.device.enabled_extensions().ext_buffer_device_address
+            && self.usage.intersects(BufferUsage::SHADER_DEVICE_ADDRESS)
+            && !memory
+                .flags()
+                .intersects(MemoryAllocateFlags::DEVICE_ADDRESS)
+        {
+            return Err(BufferError::MemoryBufferDeviceAddressNotSupported);
+        }
+
         Ok(())
+    }
+
+    #[cfg_attr(not(feature = "document_unchecked"), doc(hidden))]
+    pub unsafe fn bind_memory_unchecked(
+        self,
+        allocation: MemoryAlloc,
+    ) -> Result<Buffer, (VulkanError, RawBuffer, MemoryAlloc)> {
+        let memory = allocation.device_memory();
+        let memory_offset = allocation.offset();
+
+        let fns = self.device.fns();
+
+        let result = if self.device.api_version() >= Version::V1_1
+            || self.device.enabled_extensions().khr_bind_memory2
+        {
+            let bind_infos_vk = [ash::vk::BindBufferMemoryInfo {
+                buffer: self.handle,
+                memory: memory.handle(),
+                memory_offset,
+                ..Default::default()
+            }];
+
+            if self.device.api_version() >= Version::V1_1 {
+                (fns.v1_1.bind_buffer_memory2)(
+                    self.device.handle(),
+                    bind_infos_vk.len() as u32,
+                    bind_infos_vk.as_ptr(),
+                )
+            } else {
+                (fns.khr_bind_memory2.bind_buffer_memory2_khr)(
+                    self.device.handle(),
+                    bind_infos_vk.len() as u32,
+                    bind_infos_vk.as_ptr(),
+                )
+            }
+        } else {
+            (fns.v1_0.bind_buffer_memory)(
+                self.device.handle(),
+                self.handle,
+                memory.handle(),
+                memory_offset,
+            )
+        }
+        .result();
+
+        if let Err(err) = result {
+            return Err((VulkanError::from(err), self, allocation));
+        }
+
+        Ok(Buffer::from_raw(self, BufferMemory::Normal(allocation)))
+    }
+
+    /// Returns the memory requirements for this buffer.
+    pub fn memory_requirements(&self) -> &MemoryRequirements {
+        &self.memory_requirements
+    }
+
+    /// Returns the flags the buffer was created with.
+    #[inline]
+    pub fn flags(&self) -> BufferCreateFlags {
+        self.flags
     }
 
     /// Returns the size of the buffer in bytes.
@@ -304,288 +584,210 @@ impl UnsafeBuffer {
         self.size
     }
 
-    /// Returns the buffer the image was created with.
+    /// Returns the usage the buffer was created with.
     #[inline]
     pub fn usage(&self) -> BufferUsage {
         self.usage
     }
 
-    /// Returns a key unique to each `UnsafeBuffer`. Can be used for the `conflicts_key` method.
+    /// Returns the sharing the buffer was created with.
     #[inline]
-    pub fn key(&self) -> u64 {
-        self.buffer.as_raw()
+    pub fn sharing(&self) -> &Sharing<SmallVec<[u32; 4]>> {
+        &self.sharing
+    }
+
+    /// Returns the external memory handle types that are supported with this buffer.
+    #[inline]
+    pub fn external_memory_handle_types(&self) -> ExternalMemoryHandleTypes {
+        self.external_memory_handle_types
     }
 }
 
-unsafe impl VulkanObject for UnsafeBuffer {
-    type Object = ash::vk::Buffer;
-
+impl Drop for RawBuffer {
     #[inline]
-    fn internal_object(&self) -> ash::vk::Buffer {
-        self.buffer
+    fn drop(&mut self) {
+        unsafe {
+            let fns = self.device.fns();
+            (fns.v1_0.destroy_buffer)(self.device.handle(), self.handle, ptr::null());
+        }
     }
 }
 
-unsafe impl DeviceOwned for UnsafeBuffer {
+unsafe impl VulkanObject for RawBuffer {
+    type Handle = ash::vk::Buffer;
+
+    #[inline]
+    fn handle(&self) -> Self::Handle {
+        self.handle
+    }
+}
+
+unsafe impl DeviceOwned for RawBuffer {
     #[inline]
     fn device(&self) -> &Arc<Device> {
         &self.device
     }
 }
 
-impl fmt::Debug for UnsafeBuffer {
+impl_id_counter!(RawBuffer);
+
+/// Parameters to create a new [`Buffer`].
+#[derive(Clone, Debug)]
+pub struct BufferCreateInfo {
+    /// Flags to enable.
+    ///
+    /// The default value is [`BufferCreateFlags::empty()`].
+    pub flags: BufferCreateFlags,
+
+    /// Whether the buffer can be shared across multiple queues, or is limited to a single queue.
+    ///
+    /// The default value is [`Sharing::Exclusive`].
+    pub sharing: Sharing<SmallVec<[u32; 4]>>,
+
+    /// The size in bytes of the buffer.
+    ///
+    /// The default value is `0`, which must be overridden.
+    pub size: DeviceSize,
+
+    /// How the buffer is going to be used.
+    ///
+    /// The default value is [`BufferUsage::empty()`], which must be overridden.
+    pub usage: BufferUsage,
+
+    /// The external memory handle types that are going to be used with the buffer.
+    ///
+    /// If this value is not empty, then the device API version must be at least 1.1, or the
+    /// [`khr_external_memory`] extension must be enabled on the device.
+    ///
+    /// The default value is [`ExternalMemoryHandleTypes::empty()`].
+    ///
+    /// [`khr_external_memory`]: crate::device::DeviceExtensions::khr_external_memory
+    pub external_memory_handle_types: ExternalMemoryHandleTypes,
+
+    pub _ne: crate::NonExhaustive,
+}
+
+impl Default for BufferCreateInfo {
     #[inline]
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(fmt, "<Vulkan buffer {:?}>", self.buffer)
-    }
-}
-
-impl Drop for UnsafeBuffer {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            let fns = self.device.fns();
-            fns.v1_0
-                .destroy_buffer(self.device.internal_object(), self.buffer, ptr::null());
-        }
-    }
-}
-
-impl PartialEq for UnsafeBuffer {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.buffer == other.buffer && self.device == other.device
-    }
-}
-
-impl Eq for UnsafeBuffer {}
-
-impl Hash for UnsafeBuffer {
-    #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.buffer.hash(state);
-        self.device.hash(state);
-    }
-}
-
-/// The level of sparse binding that a buffer should be created with.
-#[derive(Debug, Copy, Clone)]
-pub struct SparseLevel {
-    pub sparse_residency: bool,
-    pub sparse_aliased: bool,
-}
-
-impl SparseLevel {
-    #[inline]
-    pub fn none() -> SparseLevel {
-        SparseLevel {
-            sparse_residency: false,
-            sparse_aliased: false,
-        }
-    }
-}
-
-impl From<SparseLevel> for ash::vk::BufferCreateFlags {
-    #[inline]
-    fn from(val: SparseLevel) -> Self {
-        let mut result = ash::vk::BufferCreateFlags::SPARSE_BINDING;
-        if val.sparse_residency {
-            result |= ash::vk::BufferCreateFlags::SPARSE_RESIDENCY;
-        }
-        if val.sparse_aliased {
-            result |= ash::vk::BufferCreateFlags::SPARSE_ALIASED;
-        }
-        result
-    }
-}
-
-/// The device address usage flag was not set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceAddressUsageNotEnabledError;
-impl error::Error for DeviceAddressUsageNotEnabledError {}
-impl fmt::Display for DeviceAddressUsageNotEnabledError {
-    #[inline]
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.write_str("the device address usage flag was not set on this buffer")
-    }
-}
-
-/// Error that can happen when creating a buffer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BufferCreationError {
-    /// Allocating memory failed.
-    AllocError(DeviceMemoryAllocError),
-    /// Sparse binding was requested but the corresponding feature wasn't enabled.
-    SparseBindingFeatureNotEnabled,
-    /// Sparse residency was requested but the corresponding feature wasn't enabled.
-    SparseResidencyBufferFeatureNotEnabled,
-    /// Sparse aliasing was requested but the corresponding feature wasn't enabled.
-    SparseResidencyAliasedFeatureNotEnabled,
-    /// Device address was requested but the corresponding feature wasn't enabled.
-    DeviceAddressFeatureNotEnabled,
-}
-
-impl error::Error for BufferCreationError {
-    #[inline]
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
-            BufferCreationError::AllocError(ref err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for BufferCreationError {
-    #[inline]
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(
-            fmt,
-            "{}",
-            match *self {
-                BufferCreationError::AllocError(_) => "allocating memory failed",
-                BufferCreationError::SparseBindingFeatureNotEnabled => {
-                    "sparse binding was requested but the corresponding feature wasn't enabled"
-                }
-                BufferCreationError::SparseResidencyBufferFeatureNotEnabled => {
-                    "sparse residency was requested but the corresponding feature wasn't enabled"
-                }
-                BufferCreationError::SparseResidencyAliasedFeatureNotEnabled => {
-                    "sparse aliasing was requested but the corresponding feature wasn't enabled"
-                }
-                BufferCreationError::DeviceAddressFeatureNotEnabled => {
-                    "device address was requested but the corresponding feature wasn't enabled"
-                }
-            }
-        )
-    }
-}
-
-impl From<OomError> for BufferCreationError {
-    #[inline]
-    fn from(err: OomError) -> BufferCreationError {
-        BufferCreationError::AllocError(err.into())
-    }
-}
-
-impl From<Error> for BufferCreationError {
-    #[inline]
-    fn from(err: Error) -> BufferCreationError {
-        match err {
-            err @ Error::OutOfHostMemory => {
-                BufferCreationError::AllocError(DeviceMemoryAllocError::from(err))
-            }
-            err @ Error::OutOfDeviceMemory => {
-                BufferCreationError::AllocError(DeviceMemoryAllocError::from(err))
-            }
-            _ => panic!("unexpected error: {:?}", err),
+    fn default() -> Self {
+        Self {
+            flags: BufferCreateFlags::empty(),
+            sharing: Sharing::Exclusive,
+            size: 0,
+            usage: BufferUsage::empty(),
+            external_memory_handle_types: ExternalMemoryHandleTypes::empty(),
+            _ne: crate::NonExhaustive(()),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::iter::Empty;
-
-    use super::BufferCreationError;
-    use super::BufferUsage;
-    use super::SparseLevel;
-    use super::UnsafeBuffer;
-
-    use crate::device::Device;
-    use crate::device::DeviceOwned;
-    use crate::sync::Sharing;
+    use super::{BufferCreateInfo, BufferUsage, RawBuffer};
+    use crate::device::{Device, DeviceOwned};
 
     #[test]
     fn create() {
         let (device, _) = gfx_dev_and_queue!();
-        let (buf, reqs) = unsafe {
-            UnsafeBuffer::new(
-                device.clone(),
-                128,
-                BufferUsage::all(),
-                Sharing::Exclusive::<Empty<_>>,
-                None,
-            )
-        }
+        let buf = RawBuffer::new(
+            device.clone(),
+            BufferCreateInfo {
+                size: 128,
+                usage: BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+        )
         .unwrap();
+        let reqs = buf.memory_requirements();
 
-        assert!(reqs.size >= 128);
+        assert!(reqs.layout.size() >= 128);
         assert_eq!(buf.size(), 128);
         assert_eq!(&**buf.device() as *const Device, &*device as *const Device);
     }
 
+    /* Re-enable when sparse binding is properly implemented
     #[test]
     fn missing_feature_sparse_binding() {
         let (device, _) = gfx_dev_and_queue!();
-        let sparse = Some(SparseLevel::none());
-        unsafe {
-            match UnsafeBuffer::new(
-                device,
-                128,
-                BufferUsage::all(),
-                Sharing::Exclusive::<Empty<_>>,
-                sparse,
-            ) {
-                Err(BufferCreationError::SparseBindingFeatureNotEnabled) => (),
-                _ => panic!(),
-            }
-        };
+        match RawBuffer::new(
+            device,
+            BufferCreateInfo {
+                size: 128,
+                sparse: Some(BufferCreateFlags::empty()),
+                usage: BufferUsage::transfer_dst,
+                ..Default::default()
+            },
+        ) {
+            Err(BufferError::RequirementNotMet {
+                requires_one_of: RequiresOneOf { features, .. },
+                ..
+            }) if features.contains(&"sparse_binding") => (),
+            _ => panic!(),
+        }
     }
 
     #[test]
     fn missing_feature_sparse_residency() {
         let (device, _) = gfx_dev_and_queue!(sparse_binding);
-        let sparse = Some(SparseLevel {
-            sparse_residency: true,
-            sparse_aliased: false,
-        });
-        unsafe {
-            match UnsafeBuffer::new(
-                device,
-                128,
-                BufferUsage::all(),
-                Sharing::Exclusive::<Empty<_>>,
-                sparse,
-            ) {
-                Err(BufferCreationError::SparseResidencyBufferFeatureNotEnabled) => (),
-                _ => panic!(),
-            }
-        };
+        match RawBuffer::new(
+            device,
+            BufferCreateInfo {
+                size: 128,
+                sparse: Some(BufferCreateFlags {
+                    sparse_residency: true,
+                    sparse_aliased: false,
+                    ..Default::default()
+                }),
+                usage: BufferUsage::transfer_dst,
+                ..Default::default()
+            },
+        ) {
+            Err(BufferError::RequirementNotMet {
+                requires_one_of: RequiresOneOf { features, .. },
+                ..
+            }) if features.contains(&"sparse_residency_buffer") => (),
+            _ => panic!(),
+        }
     }
 
     #[test]
     fn missing_feature_sparse_aliased() {
         let (device, _) = gfx_dev_and_queue!(sparse_binding);
-        let sparse = Some(SparseLevel {
-            sparse_residency: false,
-            sparse_aliased: true,
-        });
-        unsafe {
-            match UnsafeBuffer::new(
-                device,
-                128,
-                BufferUsage::all(),
-                Sharing::Exclusive::<Empty<_>>,
-                sparse,
-            ) {
-                Err(BufferCreationError::SparseResidencyAliasedFeatureNotEnabled) => (),
-                _ => panic!(),
-            }
-        };
+        match RawBuffer::new(
+            device,
+            BufferCreateInfo {
+                size: 128,
+                sparse: Some(BufferCreateFlags {
+                    sparse_residency: false,
+                    sparse_aliased: true,
+                    ..Default::default()
+                }),
+                usage: BufferUsage::transfer_dst,
+                ..Default::default()
+            },
+        ) {
+            Err(BufferError::RequirementNotMet {
+                requires_one_of: RequiresOneOf { features, .. },
+                ..
+            }) if features.contains(&"sparse_residency_aliased") => (),
+            _ => panic!(),
+        }
     }
+    */
 
     #[test]
     fn create_empty_buffer() {
         let (device, _) = gfx_dev_and_queue!();
 
-        unsafe {
-            let _ = UnsafeBuffer::new(
+        assert_should_panic!({
+            RawBuffer::new(
                 device,
-                0,
-                BufferUsage::all(),
-                Sharing::Exclusive::<Empty<_>>,
-                None,
-            );
-        };
+                BufferCreateInfo {
+                    size: 0,
+                    usage: BufferUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+            )
+        });
     }
 }
