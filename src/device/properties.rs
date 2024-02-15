@@ -1,138 +1,25 @@
-use crate::device::physical::{
-    ConformanceVersion, DriverId, PhysicalDeviceType, PointClippingBehavior, ShaderCoreProperties,
+use super::physical::{
+    ConformanceVersion, DriverId, MemoryDecompressionMethods, OpticalFlowGridSizes,
+    PhysicalDeviceType, PipelineRobustnessBufferBehavior, PipelineRobustnessImageBehavior,
+    PointClippingBehavior, RayTracingInvocationReorderMode, ShaderCoreProperties,
     ShaderFloatControlsIndependence, SubgroupFeatures,
 };
-use crate::image::{SampleCount, SampleCounts};
-use crate::pipeline::shader::ShaderStages;
-use crate::render_pass::ResolveModes;
-use crate::Version;
-use std::convert::TryInto;
-use std::ffi::CStr;
+use crate::{
+    device::{DeviceExtensions, QueueFlags},
+    image::{SampleCount, SampleCounts},
+    instance::InstanceExtensions,
+    memory::DeviceAlignment,
+    render_pass::ResolveModes,
+    shader::ShaderStages,
+    DeviceSize, Version,
+};
+use std::{ffi::CStr, os::raw::c_char};
 
-/// this is a macro that outputs either T or Option<T> depending on the 2nd argument
-macro_rules! property_type {
-    ($ty:ty, true) => {
-        $ty
-    };
-    ($ty:ty, false) => {
-        Option<$ty>
-    };
-}
-
-pub(crate) use property_type;
-
-/// this is a macro that executes the correct from_vulkan call depending on whether or not the type is Option<T>
-macro_rules! property_from_vulkan {
-    ($ty:ty, [$($ffi_struct:ident $(.$ffi_struct_field:ident)*),+], $ffi_field:ident, true, $properties:ident) => {
-        std::array::IntoIter::new([
-            $($properties.$ffi_struct$(.$ffi_struct_field)*.$ffi_field),+
-        ]).next().and_then(|x| <$ty>::from_vulkan(x)).expect(concat!("expected good ", stringify!($ffi_field)))
-    };
-    ($ty:ty, [$($ffi_struct:ident $(.$ffi_struct_field:ident)*),+], $ffi_field:ident, false, $properties:ident) => {
-        std::array::IntoIter::new([
-            $($properties.$ffi_struct.map(|s| s$(.$ffi_struct_field)*.$ffi_field)),+
-        ]).flatten().next().and_then(|x| <$ty>::from_vulkan(x))
-    };
-}
-
-pub(crate) use property_from_vulkan;
-
-macro_rules! properties {
-    {
-        $($member:ident => {
-            doc: $doc:expr,
-            ty: $ty:ty,
-            ffi_name: $ffi_field:ident,
-            ffi_members: [$($ffi_struct:ident $(.$ffi_struct_field:ident)*),+],
-            required: $required:tt,
-        },)*
-    } => {
-        /// Represents all the properties of a physical device.
-        ///
-        /// Depending on the highest version of Vulkan supported by the physical device, and the
-        /// available extensions, not every property may be available. For that reason, properties
-        /// are wrapped in an `Option`.
-        #[derive(Clone, Debug, Default)]
-        #[allow(missing_docs)]
-        pub struct Properties {
-            $(
-                #[doc = $doc]
-                pub $member: $crate::device::properties::property_type!($ty, $required),
-            )*
-        }
-
-        impl From<&PropertiesFfi> for Properties {
-            fn from(properties_ffi: &PropertiesFfi) -> Self {
-                use crate::device::properties::FromVulkan;
-
-                Properties {
-                    $(
-                        $member: crate::device::properties::property_from_vulkan!($ty, [ $($ffi_struct$(.$ffi_struct_field)*),+ ], $ffi_field, $required, properties_ffi),
-                    )*
-                }
-            }
-        }
-    };
-}
-
-pub use crate::autogen::Properties;
-pub(crate) use properties;
-
-macro_rules! properties_ffi {
-    {
-        $api_version:ident,
-        $device_extensions:ident,
-        $instance_extensions:ident,
-        $($member:ident => {
-            ty: $ty:ident,
-            provided_by: [$($provided_by:expr),+],
-            conflicts: [$($conflicts:ident),*],
-        },)+
-    } => {
-        #[derive(Default)]
-        pub(crate) struct PropertiesFfi {
-            properties_vulkan10: ash::vk::PhysicalDeviceProperties2KHR,
-
-            $(
-                $member: Option<ash::vk::$ty>,
-            )+
-        }
-
-        impl PropertiesFfi {
-            pub(crate) fn make_chain(
-				&mut self,
-				$api_version: crate::Version,
-				$device_extensions: &crate::device::DeviceExtensions,
-				$instance_extensions: &crate::instance::InstanceExtensions,
-			) {
-                self.properties_vulkan10 = Default::default();
-                let head = &mut self.properties_vulkan10;
-
-                $(
-                    if std::array::IntoIter::new([$($provided_by),+]).any(|x| x) &&
-                        std::array::IntoIter::new([$(self.$conflicts.is_none()),*]).all(|x| x) {
-                        self.$member = Some(Default::default());
-                        let member = self.$member.as_mut().unwrap();
-                        member.p_next = head.p_next;
-                        head.p_next = member as *mut _ as _;
-                    }
-                )+
-            }
-
-            pub(crate) fn head_as_ref(&self) -> &ash::vk::PhysicalDeviceProperties2KHR {
-                &self.properties_vulkan10
-            }
-
-            pub(crate) fn head_as_mut(&mut self) -> &mut ash::vk::PhysicalDeviceProperties2KHR {
-                &mut self.properties_vulkan10
-            }
-        }
-    };
-}
-
-pub(crate) use {crate::autogen::PropertiesFfi, properties_ffi};
+// Generated by build.rs
+include!(concat!(env!("OUT_DIR"), "/properties.rs"));
 
 // A bit of a hack...
+// TODO: integrate into autogen?
 pub(crate) trait FromVulkan<F>
 where
     Self: Sized,
@@ -175,6 +62,13 @@ impl FromVulkan<u64> for u64 {
     }
 }
 
+impl FromVulkan<u64> for DeviceAlignment {
+    #[inline]
+    fn from_vulkan(val: u64) -> Option<Self> {
+        DeviceAlignment::new(val)
+    }
+}
+
 impl FromVulkan<usize> for usize {
     #[inline]
     fn from_vulkan(val: usize) -> Option<Self> {
@@ -210,9 +104,9 @@ impl<const N: usize> FromVulkan<[f32; N]> for [f32; N] {
     }
 }
 
-impl<const N: usize> FromVulkan<[std::os::raw::c_char; N]> for String {
+impl<const N: usize> FromVulkan<[c_char; N]> for String {
     #[inline]
-    fn from_vulkan(val: [std::os::raw::c_char; N]) -> Option<Self> {
+    fn from_vulkan(val: [c_char; N]) -> Option<Self> {
         Some(unsafe { CStr::from_ptr(val.as_ptr()).to_string_lossy().into_owned() })
     }
 }
@@ -252,6 +146,20 @@ impl FromVulkan<ash::vk::Extent2D> for [u32; 2] {
     }
 }
 
+impl FromVulkan<ash::vk::MemoryDecompressionMethodFlagsNV> for MemoryDecompressionMethods {
+    #[inline]
+    fn from_vulkan(val: ash::vk::MemoryDecompressionMethodFlagsNV) -> Option<Self> {
+        Some(val.into())
+    }
+}
+
+impl FromVulkan<ash::vk::OpticalFlowGridSizeFlagsNV> for OpticalFlowGridSizes {
+    #[inline]
+    fn from_vulkan(val: ash::vk::OpticalFlowGridSizeFlagsNV) -> Option<Self> {
+        Some(val.into())
+    }
+}
+
 impl FromVulkan<ash::vk::PhysicalDeviceType> for PhysicalDeviceType {
     #[inline]
     fn from_vulkan(val: ash::vk::PhysicalDeviceType) -> Option<Self> {
@@ -259,9 +167,37 @@ impl FromVulkan<ash::vk::PhysicalDeviceType> for PhysicalDeviceType {
     }
 }
 
+impl FromVulkan<ash::vk::PipelineRobustnessBufferBehaviorEXT> for PipelineRobustnessBufferBehavior {
+    #[inline]
+    fn from_vulkan(val: ash::vk::PipelineRobustnessBufferBehaviorEXT) -> Option<Self> {
+        val.try_into().ok()
+    }
+}
+
+impl FromVulkan<ash::vk::PipelineRobustnessImageBehaviorEXT> for PipelineRobustnessImageBehavior {
+    #[inline]
+    fn from_vulkan(val: ash::vk::PipelineRobustnessImageBehaviorEXT) -> Option<Self> {
+        val.try_into().ok()
+    }
+}
+
 impl FromVulkan<ash::vk::PointClippingBehavior> for PointClippingBehavior {
     #[inline]
     fn from_vulkan(val: ash::vk::PointClippingBehavior) -> Option<Self> {
+        val.try_into().ok()
+    }
+}
+
+impl FromVulkan<ash::vk::QueueFlags> for QueueFlags {
+    #[inline]
+    fn from_vulkan(val: ash::vk::QueueFlags) -> Option<Self> {
+        Some(val.into())
+    }
+}
+
+impl FromVulkan<ash::vk::RayTracingInvocationReorderModeNV> for RayTracingInvocationReorderMode {
+    #[inline]
+    fn from_vulkan(val: ash::vk::RayTracingInvocationReorderModeNV) -> Option<Self> {
         val.try_into().ok()
     }
 }
