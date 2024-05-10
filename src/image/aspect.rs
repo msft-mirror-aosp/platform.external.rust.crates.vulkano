@@ -7,139 +7,90 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use std::ops::BitOr;
+use crate::macros::vulkan_bitflags_enum;
 
-/// An individual data type within an image.
-///
-/// Most images have only the `Color` aspect, but some may have several.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum ImageAspect {
-    Color = ash::vk::ImageAspectFlags::COLOR.as_raw(),
-    Depth = ash::vk::ImageAspectFlags::DEPTH.as_raw(),
-    Stencil = ash::vk::ImageAspectFlags::STENCIL.as_raw(),
-    Metadata = ash::vk::ImageAspectFlags::METADATA.as_raw(),
-    Plane0 = ash::vk::ImageAspectFlags::PLANE_0.as_raw(),
-    Plane1 = ash::vk::ImageAspectFlags::PLANE_1.as_raw(),
-    Plane2 = ash::vk::ImageAspectFlags::PLANE_2.as_raw(),
-    MemoryPlane0 = ash::vk::ImageAspectFlags::MEMORY_PLANE_0_EXT.as_raw(),
-    MemoryPlane1 = ash::vk::ImageAspectFlags::MEMORY_PLANE_1_EXT.as_raw(),
-    MemoryPlane2 = ash::vk::ImageAspectFlags::MEMORY_PLANE_2_EXT.as_raw(),
-}
+vulkan_bitflags_enum! {
+    #[non_exhaustive]
 
-impl From<ImageAspect> for ash::vk::ImageAspectFlags {
-    #[inline]
-    fn from(val: ImageAspect) -> Self {
-        Self::from_raw(val as u32)
-    }
-}
+    /// A set of [`ImageAspect`] values.
+    ImageAspects,
 
-/// A mask specifying one or more `ImageAspect`s.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ImageAspects {
-    pub color: bool,
-    pub depth: bool,
-    pub stencil: bool,
-    pub metadata: bool,
-    pub plane0: bool,
-    pub plane1: bool,
-    pub plane2: bool,
-    pub memory_plane0: bool,
-    pub memory_plane1: bool,
-    pub memory_plane2: bool,
-}
+    /// An individual data type within an image.
+    ///
+    /// Most images have only the [`Color`] aspect, but some may have others.
+    ///
+    /// [`Color`]: ImageAspect::Color
+    ImageAspect,
 
-impl ImageAspects {
-    /// Builds an `ImageAspect` with all values set to false. Useful as a default value.
-    #[inline]
-    pub const fn none() -> ImageAspects {
-        ImageAspects {
-            color: false,
-            depth: false,
-            stencil: false,
-            metadata: false,
-            plane0: false,
-            plane1: false,
-            plane2: false,
-            memory_plane0: false,
-            memory_plane1: false,
-            memory_plane2: false,
-        }
-    }
-}
+    = ImageAspectFlags(u32);
 
-impl BitOr for ImageAspects {
-    type Output = Self;
+    /// The single aspect of images with a color [format], or the combined aspect of all planes of
+    /// images with a multi-planar format.
+    ///
+    /// [format]: crate::format::Format
+    COLOR, Color = COLOR,
 
-    #[inline]
-    fn bitor(self, rhs: Self) -> Self {
-        ImageAspects {
-            color: self.color || rhs.color,
-            depth: self.depth || rhs.depth,
-            stencil: self.stencil || rhs.stencil,
-            metadata: self.metadata || rhs.metadata,
-            plane0: self.plane0 || rhs.plane0,
-            plane1: self.plane1 || rhs.plane1,
-            plane2: self.plane2 || rhs.plane2,
-            memory_plane0: self.memory_plane0 || rhs.memory_plane0,
-            memory_plane1: self.memory_plane1 || rhs.memory_plane1,
-            memory_plane2: self.memory_plane2 || rhs.memory_plane2,
-        }
-    }
-}
+    /// The single aspect of images with a depth [format], or one of the two aspects of images
+    /// with a combined depth/stencil format.
+    ///
+    /// [format]: crate::format::Format
+    DEPTH, Depth = DEPTH,
 
-impl From<ImageAspects> for ash::vk::ImageAspectFlags {
-    #[inline]
-    fn from(value: ImageAspects) -> ash::vk::ImageAspectFlags {
-        let mut result = ash::vk::ImageAspectFlags::empty();
-        if value.color {
-            result |= ash::vk::ImageAspectFlags::COLOR;
-        }
-        if value.depth {
-            result |= ash::vk::ImageAspectFlags::DEPTH;
-        }
-        if value.stencil {
-            result |= ash::vk::ImageAspectFlags::STENCIL;
-        }
-        if value.metadata {
-            result |= ash::vk::ImageAspectFlags::METADATA;
-        }
-        if value.plane0 {
-            result |= ash::vk::ImageAspectFlags::PLANE_0;
-        }
-        if value.plane1 {
-            result |= ash::vk::ImageAspectFlags::PLANE_1;
-        }
-        if value.plane2 {
-            result |= ash::vk::ImageAspectFlags::PLANE_2;
-        }
-        if value.memory_plane0 {
-            result |= ash::vk::ImageAspectFlags::MEMORY_PLANE_0_EXT;
-        }
-        if value.memory_plane1 {
-            result |= ash::vk::ImageAspectFlags::MEMORY_PLANE_1_EXT;
-        }
-        if value.memory_plane2 {
-            result |= ash::vk::ImageAspectFlags::MEMORY_PLANE_2_EXT
-        }
-        result
-    }
-}
+    /// The single aspect of images with a stencil [format], or one of the two aspects of images
+    /// with a combined depth/stencil format.
+    ///
+    /// [format]: crate::format::Format
+    STENCIL, Stencil = STENCIL,
 
-impl From<ash::vk::ImageAspectFlags> for ImageAspects {
-    #[inline]
-    fn from(val: ash::vk::ImageAspectFlags) -> ImageAspects {
-        ImageAspects {
-            color: !(val & ash::vk::ImageAspectFlags::COLOR).is_empty(),
-            depth: !(val & ash::vk::ImageAspectFlags::DEPTH).is_empty(),
-            stencil: !(val & ash::vk::ImageAspectFlags::STENCIL).is_empty(),
-            metadata: !(val & ash::vk::ImageAspectFlags::METADATA).is_empty(),
-            plane0: !(val & ash::vk::ImageAspectFlags::PLANE_0).is_empty(),
-            plane1: !(val & ash::vk::ImageAspectFlags::PLANE_1).is_empty(),
-            plane2: !(val & ash::vk::ImageAspectFlags::PLANE_2).is_empty(),
-            memory_plane0: !(val & ash::vk::ImageAspectFlags::MEMORY_PLANE_0_EXT).is_empty(),
-            memory_plane1: !(val & ash::vk::ImageAspectFlags::MEMORY_PLANE_1_EXT).is_empty(),
-            memory_plane2: !(val & ash::vk::ImageAspectFlags::MEMORY_PLANE_2_EXT).is_empty(),
-        }
-    }
+    /// An aspect used with sparse memory on some implementations, to hold implementation-defined
+    /// metadata of an image.
+    METADATA, Metadata = METADATA,
+
+    /// The first plane of an image with a multi-planar [format], holding the green color component.
+    ///
+    /// [format]: crate::format::Format
+    PLANE_0, Plane0 = PLANE_0 {
+        api_version: V1_1,
+        device_extensions: [khr_sampler_ycbcr_conversion],
+    },
+
+    /// The second plane of an image with a multi-planar [format], holding the blue color component
+    /// if the format has three planes, and a combination of blue and red if the format has two
+    /// planes.
+    ///
+    /// [format]: crate::format::Format
+    PLANE_1, Plane1 = PLANE_1 {
+        api_version: V1_1,
+        device_extensions: [khr_sampler_ycbcr_conversion],
+    },
+
+    /// The third plane of an image with a multi-planar [format], holding the red color component.
+    PLANE_2, Plane2 = PLANE_2 {
+        api_version: V1_1,
+        device_extensions: [khr_sampler_ycbcr_conversion],
+    },
+
+    /// The first memory plane of images created through the [`ext_image_drm_format_modifier`]
+    /// extension.
+    ///
+    /// [`ext_image_drm_format_modifier`]: crate::device::DeviceExtensions::ext_image_drm_format_modifier
+    MEMORY_PLANE_0, MemoryPlane0 = MEMORY_PLANE_0_EXT {
+        device_extensions: [ext_image_drm_format_modifier],
+    },
+
+    /// The second memory plane of images created through the [`ext_image_drm_format_modifier`]
+    /// extension.
+    ///
+    /// [`ext_image_drm_format_modifier`]: crate::device::DeviceExtensions::ext_image_drm_format_modifier
+    MEMORY_PLANE_1, MemoryPlane1 = MEMORY_PLANE_1_EXT {
+        device_extensions: [ext_image_drm_format_modifier],
+    },
+
+    /// The third memory plane of images created through the [`ext_image_drm_format_modifier`]
+    /// extension.
+    ///
+    /// [`ext_image_drm_format_modifier`]: crate::device::DeviceExtensions::ext_image_drm_format_modifier
+    MEMORY_PLANE_2, MemoryPlane2 = MEMORY_PLANE_2_EXT {
+        device_extensions: [ext_image_drm_format_modifier],
+    },
 }
