@@ -7,29 +7,28 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::sync::Mutex;
-
-use crate::buffer::BufferAccess;
-use crate::command_buffer::submit::SubmitAnyBuilder;
-use crate::command_buffer::submit::SubmitCommandBufferBuilder;
-use crate::command_buffer::submit::SubmitSemaphoresWaitBuilder;
-use crate::device::Device;
-use crate::device::DeviceOwned;
-use crate::device::Queue;
-use crate::image::ImageAccess;
-use crate::image::ImageLayout;
-use crate::sync::AccessCheckError;
-use crate::sync::AccessFlags;
-use crate::sync::FlushError;
-use crate::sync::GpuFuture;
-use crate::sync::PipelineStages;
-use crate::sync::Semaphore;
+use super::{AccessCheckError, FlushError, GpuFuture, SubmitAnyBuilder};
+use crate::{
+    buffer::Buffer,
+    command_buffer::{SemaphoreSubmitInfo, SubmitInfo},
+    device::{Device, DeviceOwned, Queue},
+    image::{sys::Image, ImageLayout},
+    swapchain::Swapchain,
+    sync::{future::AccessError, semaphore::Semaphore, PipelineStages},
+    DeviceSize,
+};
+use parking_lot::Mutex;
+use smallvec::smallvec;
+use std::{
+    ops::Range,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+};
 
 /// Builds a new semaphore signal future.
-#[inline]
 pub fn then_signal_semaphore<F>(future: F) -> SemaphoreSignalFuture<F>
 where
     F: GpuFuture,
@@ -40,7 +39,7 @@ where
 
     SemaphoreSignalFuture {
         previous: future,
-        semaphore: Semaphore::from_pool(device).unwrap(),
+        semaphore: Arc::new(Semaphore::from_pool(device).unwrap()),
         wait_submitted: Mutex::new(false),
         finished: AtomicBool::new(false),
     }
@@ -54,7 +53,7 @@ where
     F: GpuFuture,
 {
     previous: F,
-    semaphore: Semaphore,
+    semaphore: Arc<Semaphore>,
     // True if the signaling command has already been submitted.
     // If flush is called multiple times, we want to block so that only one flushing is executed.
     // Therefore we use a `Mutex<bool>` and not an `AtomicBool`.
@@ -66,58 +65,120 @@ unsafe impl<F> GpuFuture for SemaphoreSignalFuture<F>
 where
     F: GpuFuture,
 {
-    #[inline]
     fn cleanup_finished(&mut self) {
         self.previous.cleanup_finished();
     }
 
-    #[inline]
     unsafe fn build_submission(&self) -> Result<SubmitAnyBuilder, FlushError> {
         // Flushing the signaling part, since it must always be submitted before the waiting part.
         self.flush()?;
+        let sem = smallvec![self.semaphore.clone()];
 
-        let mut sem = SubmitSemaphoresWaitBuilder::new();
-        sem.add_wait_semaphore(&self.semaphore);
         Ok(SubmitAnyBuilder::SemaphoresWait(sem))
     }
 
     fn flush(&self) -> Result<(), FlushError> {
         unsafe {
-            let mut wait_submitted = self.wait_submitted.lock().unwrap();
+            let mut wait_submitted = self.wait_submitted.lock();
 
             if *wait_submitted {
                 return Ok(());
             }
 
-            let queue = self.previous.queue().unwrap().clone();
+            let queue = self.previous.queue().unwrap();
 
             match self.previous.build_submission()? {
                 SubmitAnyBuilder::Empty => {
-                    let mut builder = SubmitCommandBufferBuilder::new();
-                    builder.add_signal_semaphore(&self.semaphore);
-                    builder.submit(&queue)?;
+                    queue.with(|mut q| {
+                        q.submit_unchecked(
+                            [SubmitInfo {
+                                signal_semaphores: vec![SemaphoreSubmitInfo::semaphore(
+                                    self.semaphore.clone(),
+                                )],
+                                ..Default::default()
+                            }],
+                            None,
+                        )
+                    })?;
                 }
-                SubmitAnyBuilder::SemaphoresWait(sem) => {
-                    let mut builder: SubmitCommandBufferBuilder = sem.into();
-                    builder.add_signal_semaphore(&self.semaphore);
-                    builder.submit(&queue)?;
+                SubmitAnyBuilder::SemaphoresWait(semaphores) => {
+                    queue.with(|mut q| {
+                        q.submit_unchecked(
+                            [SubmitInfo {
+                                wait_semaphores: semaphores
+                                    .into_iter()
+                                    .map(|semaphore| {
+                                        SemaphoreSubmitInfo {
+                                            // TODO: correct stages ; hard
+                                            stages: PipelineStages::ALL_COMMANDS,
+                                            ..SemaphoreSubmitInfo::semaphore(semaphore)
+                                        }
+                                    })
+                                    .collect(),
+                                signal_semaphores: vec![SemaphoreSubmitInfo::semaphore(
+                                    self.semaphore.clone(),
+                                )],
+                                ..Default::default()
+                            }],
+                            None,
+                        )
+                    })?;
                 }
-                SubmitAnyBuilder::CommandBuffer(mut builder) => {
-                    debug_assert_eq!(builder.num_signal_semaphores(), 0);
-                    builder.add_signal_semaphore(&self.semaphore);
-                    builder.submit(&queue)?;
+                SubmitAnyBuilder::CommandBuffer(mut submit_info, fence) => {
+                    debug_assert!(submit_info.signal_semaphores.is_empty());
+
+                    submit_info
+                        .signal_semaphores
+                        .push(SemaphoreSubmitInfo::semaphore(self.semaphore.clone()));
+
+                    queue.with(|mut q| {
+                        q.submit_with_future(submit_info, fence, &self.previous, &queue)
+                    })?;
                 }
-                SubmitAnyBuilder::BindSparse(_) => {
+                SubmitAnyBuilder::BindSparse(_, _) => {
                     unimplemented!() // TODO: how to do that?
                                      /*debug_assert_eq!(builder.num_signal_semaphores(), 0);
                                      builder.add_signal_semaphore(&self.semaphore);
                                      builder.submit(&queue)?;*/
                 }
-                SubmitAnyBuilder::QueuePresent(present) => {
-                    present.submit(&queue)?;
-                    let mut builder = SubmitCommandBufferBuilder::new();
-                    builder.add_signal_semaphore(&self.semaphore);
-                    builder.submit(&queue)?; // FIXME: problematic because if we return an error and flush() is called again, then we'll submit the present twice
+                SubmitAnyBuilder::QueuePresent(present_info) => {
+                    // VUID-VkPresentIdKHR-presentIds-04999
+                    for swapchain_info in &present_info.swapchain_infos {
+                        if swapchain_info.present_id.map_or(false, |present_id| {
+                            !swapchain_info.swapchain.try_claim_present_id(present_id)
+                        }) {
+                            return Err(FlushError::PresentIdLessThanOrEqual);
+                        }
+
+                        match self.previous.check_swapchain_image_acquired(
+                            &swapchain_info.swapchain,
+                            swapchain_info.image_index,
+                            true,
+                        ) {
+                            Ok(_) => (),
+                            Err(AccessCheckError::Unknown) => {
+                                return Err(AccessError::SwapchainImageNotAcquired.into())
+                            }
+                            Err(AccessCheckError::Denied(e)) => return Err(e.into()),
+                        }
+                    }
+
+                    queue.with(|mut q| {
+                        q.present_unchecked(present_info)?
+                            .map(|r| r.map(|_| ()))
+                            .fold(Ok(()), Result::and)?;
+                        // FIXME: problematic because if we return an error and flush() is called again, then we'll submit the present twice
+                        q.submit_unchecked(
+                            [SubmitInfo {
+                                signal_semaphores: vec![SemaphoreSubmitInfo::semaphore(
+                                    self.semaphore.clone(),
+                                )],
+                                ..Default::default()
+                            }],
+                            None,
+                        )?;
+                        Ok::<_, FlushError>(())
+                    })?;
                 }
             };
 
@@ -127,46 +188,52 @@ where
         }
     }
 
-    #[inline]
     unsafe fn signal_finished(&self) {
-        debug_assert!(*self.wait_submitted.lock().unwrap());
+        debug_assert!(*self.wait_submitted.lock());
         self.finished.store(true, Ordering::SeqCst);
         self.previous.signal_finished();
     }
 
-    #[inline]
     fn queue_change_allowed(&self) -> bool {
         true
     }
 
-    #[inline]
     fn queue(&self) -> Option<Arc<Queue>> {
         self.previous.queue()
     }
 
-    #[inline]
     fn check_buffer_access(
         &self,
-        buffer: &dyn BufferAccess,
+        buffer: &Buffer,
+        range: Range<DeviceSize>,
         exclusive: bool,
         queue: &Queue,
-    ) -> Result<Option<(PipelineStages, AccessFlags)>, AccessCheckError> {
+    ) -> Result<(), AccessCheckError> {
         self.previous
-            .check_buffer_access(buffer, exclusive, queue)
-            .map(|_| None)
+            .check_buffer_access(buffer, range, exclusive, queue)
+    }
+
+    fn check_image_access(
+        &self,
+        image: &Image,
+        range: Range<DeviceSize>,
+        exclusive: bool,
+        expected_layout: ImageLayout,
+        queue: &Queue,
+    ) -> Result<(), AccessCheckError> {
+        self.previous
+            .check_image_access(image, range, exclusive, expected_layout, queue)
     }
 
     #[inline]
-    fn check_image_access(
+    fn check_swapchain_image_acquired(
         &self,
-        image: &dyn ImageAccess,
-        layout: ImageLayout,
-        exclusive: bool,
-        queue: &Queue,
-    ) -> Result<Option<(PipelineStages, AccessFlags)>, AccessCheckError> {
+        swapchain: &Swapchain,
+        image_index: u32,
+        _before: bool,
+    ) -> Result<(), AccessCheckError> {
         self.previous
-            .check_image_access(image, layout, exclusive, queue)
-            .map(|_| None)
+            .check_swapchain_image_acquired(swapchain, image_index, false)
     }
 }
 
@@ -174,7 +241,6 @@ unsafe impl<F> DeviceOwned for SemaphoreSignalFuture<F>
 where
     F: GpuFuture,
 {
-    #[inline]
     fn device(&self) -> &Arc<Device> {
         self.semaphore.device()
     }
@@ -185,14 +251,12 @@ where
     F: GpuFuture,
 {
     fn drop(&mut self) {
-        unsafe {
-            if !*self.finished.get_mut() {
-                // TODO: handle errors?
-                self.flush().unwrap();
-                // Block until the queue finished.
-                self.queue().unwrap().wait().unwrap();
-                self.previous.signal_finished();
-            }
+        if !*self.finished.get_mut() && !thread::panicking() {
+            // TODO: handle errors?
+            self.flush().unwrap();
+            // Block until the queue finished.
+            self.queue().unwrap().with(|mut q| q.wait_idle()).unwrap();
+            unsafe { self.previous.signal_finished() };
         }
     }
 }

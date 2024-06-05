@@ -7,615 +7,737 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use crate::check_errors;
-use crate::device::physical::MemoryType;
-use crate::device::Device;
-use crate::device::DeviceOwned;
-use crate::memory::Content;
-use crate::memory::DedicatedAlloc;
-use crate::memory::ExternalMemoryHandleType;
-use crate::DeviceSize;
-use crate::Error;
-use crate::OomError;
-use crate::Version;
-use crate::VulkanObject;
-use std::error;
-use std::fmt;
-#[cfg(any(target_os = "android", target_os = "linux"))]
-use std::fs::File;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::ops::Deref;
-use std::ops::DerefMut;
-use std::ops::Range;
-use std::os::raw::c_void;
-#[cfg(any(target_os = "android", target_os = "linux"))]
-use std::os::unix::io::{FromRawFd, IntoRawFd};
-use std::ptr;
-use std::sync::Arc;
-use std::sync::Mutex;
+use super::{DedicatedAllocation, DedicatedTo, DeviceAlignment};
+use crate::{
+    device::{Device, DeviceOwned},
+    macros::{impl_id_counter, vulkan_bitflags, vulkan_bitflags_enum},
+    memory::{is_aligned, MemoryPropertyFlags},
+    DeviceSize, OomError, RequirementNotMet, RequiresOneOf, Version, VulkanError, VulkanObject,
+};
+use std::{
+    error::Error,
+    ffi::c_void,
+    fmt::{Display, Error as FmtError, Formatter},
+    fs::File,
+    mem::MaybeUninit,
+    num::NonZeroU64,
+    ops::Range,
+    ptr, slice,
+    sync::{atomic::Ordering, Arc},
+};
 
-#[repr(C)]
-pub struct BaseOutStructure {
-    pub s_type: i32,
-    pub p_next: *mut BaseOutStructure,
-}
-
-pub(crate) unsafe fn ptr_chain_iter<T>(ptr: &mut T) -> impl Iterator<Item = *mut BaseOutStructure> {
-    let ptr: *mut BaseOutStructure = ptr as *mut T as _;
-    (0..).scan(ptr, |p_ptr, _| {
-        if p_ptr.is_null() {
-            return None;
-        }
-        let n_ptr = (**p_ptr).p_next as *mut BaseOutStructure;
-        let old = *p_ptr;
-        *p_ptr = n_ptr;
-        Some(old)
-    })
-}
-
-pub unsafe trait ExtendsMemoryAllocateInfo {}
-unsafe impl ExtendsMemoryAllocateInfo for ash::vk::MemoryDedicatedAllocateInfoKHR {}
-unsafe impl ExtendsMemoryAllocateInfo for ash::vk::ExportMemoryAllocateInfo {}
-unsafe impl ExtendsMemoryAllocateInfo for ash::vk::ImportMemoryFdInfoKHR {}
-
-/// Represents memory that has been allocated.
+/// Represents memory that has been allocated from the device.
 ///
 /// The destructor of `DeviceMemory` automatically frees the memory.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```
-/// use vulkano::memory::DeviceMemory;
+/// use vulkano::memory::{DeviceMemory, MemoryAllocateInfo};
 ///
 /// # let device: std::sync::Arc<vulkano::device::Device> = return;
-/// let mem_ty = device.physical_device().memory_types().next().unwrap();
+/// let memory_type_index = 0;
 ///
 /// // Allocates 1KB of memory.
-/// let memory = DeviceMemory::alloc(device.clone(), mem_ty, 1024).unwrap();
+/// let memory = DeviceMemory::allocate(
+///     device.clone(),
+///     MemoryAllocateInfo {
+///         allocation_size: 1024,
+///         memory_type_index,
+///         ..Default::default()
+///     },
+/// )
+/// .unwrap();
 /// ```
+#[derive(Debug)]
 pub struct DeviceMemory {
-    memory: ash::vk::DeviceMemory,
+    handle: ash::vk::DeviceMemory,
     device: Arc<Device>,
-    size: DeviceSize,
+    id: NonZeroU64,
+
+    allocation_size: DeviceSize,
     memory_type_index: u32,
-    handle_types: ExternalMemoryHandleType,
-    mapped: Mutex<bool>,
-}
-
-/// Represents a builder for the device memory object.
-///
-/// # Example
-///
-/// ```
-/// use vulkano::memory::DeviceMemoryBuilder;
-///
-/// # let device: std::sync::Arc<vulkano::device::Device> = return;
-/// let mem_ty = device.physical_device().memory_types().next().unwrap();
-///
-/// // Allocates 1KB of memory.
-/// let memory = DeviceMemoryBuilder::new(device, mem_ty.id(), 1024).build().unwrap();
-/// ```
-pub struct DeviceMemoryBuilder<'a> {
-    device: Arc<Device>,
-    allocate: ash::vk::MemoryAllocateInfo,
-    dedicated_info: Option<ash::vk::MemoryDedicatedAllocateInfoKHR>,
-    export_info: Option<ash::vk::ExportMemoryAllocateInfo>,
-    import_info: Option<ash::vk::ImportMemoryFdInfoKHR>,
-    marker: PhantomData<&'a ()>,
-}
-
-impl<'a> DeviceMemoryBuilder<'a> {
-    /// Returns a new `DeviceMemoryBuilder` given the required device, memory type and size fields.
-    /// Validation of parameters is done when the builder is built.
-    pub fn new(
-        device: Arc<Device>,
-        memory_index: u32,
-        size: DeviceSize,
-    ) -> DeviceMemoryBuilder<'a> {
-        let allocate = ash::vk::MemoryAllocateInfo {
-            allocation_size: size,
-            memory_type_index: memory_index,
-            ..Default::default()
-        };
-
-        DeviceMemoryBuilder {
-            device,
-            allocate,
-            dedicated_info: None,
-            export_info: None,
-            import_info: None,
-            marker: PhantomData,
-        }
-    }
-
-    /// Sets an optional field for dedicated allocations in the `DeviceMemoryBuilder`.  To maintain
-    /// backwards compatibility, this function does nothing when dedicated allocation has not been
-    /// enabled on the device.
-    ///
-    /// # Panic
-    ///
-    /// - Panics if the dedicated allocation info has already been set.
-    pub fn dedicated_info(mut self, dedicated: DedicatedAlloc<'a>) -> DeviceMemoryBuilder {
-        assert!(self.dedicated_info.is_none());
-
-        if !(self.device.api_version() >= Version::V1_1
-            || self.device.enabled_extensions().khr_dedicated_allocation)
-        {
-            return self;
-        }
-
-        let mut dedicated_info = match dedicated {
-            DedicatedAlloc::Buffer(buffer) => ash::vk::MemoryDedicatedAllocateInfoKHR {
-                image: ash::vk::Image::null(),
-                buffer: buffer.internal_object(),
-                ..Default::default()
-            },
-            DedicatedAlloc::Image(image) => ash::vk::MemoryDedicatedAllocateInfoKHR {
-                image: image.internal_object(),
-                buffer: ash::vk::Buffer::null(),
-                ..Default::default()
-            },
-            DedicatedAlloc::None => return self,
-        };
-
-        self = self.push_next(&mut dedicated_info);
-        self.dedicated_info = Some(dedicated_info);
-        self
-    }
-
-    /// Sets an optional field for exportable allocations in the `DeviceMemoryBuilder`.
-    ///
-    /// # Panic
-    ///
-    /// - Panics if the export info has already been set.
-    pub fn export_info(
-        mut self,
-        handle_types: ExternalMemoryHandleType,
-    ) -> DeviceMemoryBuilder<'a> {
-        assert!(self.export_info.is_none());
-
-        let mut export_info = ash::vk::ExportMemoryAllocateInfo {
-            handle_types: handle_types.into(),
-            ..Default::default()
-        };
-
-        self = self.push_next(&mut export_info);
-        self.export_info = Some(export_info);
-        self
-    }
-
-    /// Sets an optional field for importable DeviceMemory in the `DeviceMemoryBuilder`.
-    ///
-    /// # Panic
-    ///
-    /// - Panics if the import info has already been set.
-    #[cfg(any(target_os = "android", target_os = "linux"))]
-    pub fn import_info(
-        mut self,
-        fd: File,
-        handle_types: ExternalMemoryHandleType,
-    ) -> DeviceMemoryBuilder<'a> {
-        assert!(self.import_info.is_none());
-
-        let mut import_info = ash::vk::ImportMemoryFdInfoKHR {
-            handle_type: handle_types.into(),
-            fd: fd.into_raw_fd(),
-            ..Default::default()
-        };
-
-        self = self.push_next(&mut import_info);
-        self.import_info = Some(import_info);
-        self
-    }
-
-    // Private function copied shamelessly from Ash.
-    // https://github.com/MaikKlein/ash/blob/4ba8637d018fec6d6e3a90d7fa47d11c085f6b4a/generator/src/lib.rs
-    #[allow(unused_assignments)]
-    fn push_next<T: ExtendsMemoryAllocateInfo>(self, next: &mut T) -> DeviceMemoryBuilder<'a> {
-        unsafe {
-            // `next` here can contain a pointer chain. This means that we must correctly
-            // attach he head to the root and the tail to the rest of the chain
-            // For example:
-            //
-            // next = A -> B
-            // Before: `Root -> C -> D -> E`
-            // After: `Root -> A -> B -> C -> D -> E`
-
-            // Convert next to our ptr structure
-            let next_ptr = next as *mut T as *mut BaseOutStructure;
-            // Previous head (can be null)
-            let mut prev_head = self.allocate.p_next as *mut BaseOutStructure;
-            // Retrieve end of next chain
-            let last_next = ptr_chain_iter(next).last().unwrap();
-            // Set end of next chain's next to be previous head only if previous head's next'
-            if !prev_head.is_null() {
-                (*last_next).p_next = (*prev_head).p_next;
-            }
-            // Set next ptr to be first one
-            prev_head = next_ptr;
-        }
-
-        self
-    }
-
-    /// Creates a `DeviceMemory` object on success, consuming the `DeviceMemoryBuilder`.  An error
-    /// is returned if the requested allocation is too large or if the total number of allocations
-    /// would exceed per-device limits.
-    pub fn build(self) -> Result<Arc<DeviceMemory>, DeviceMemoryAllocError> {
-        if self.allocate.allocation_size == 0 {
-            return Err(DeviceMemoryAllocError::InvalidSize)?;
-        }
-
-        // VUID-vkAllocateMemory-pAllocateInfo-01714: "pAllocateInfo->memoryTypeIndex must be less
-        // than VkPhysicalDeviceMemoryProperties::memoryTypeCount as returned by
-        // vkGetPhysicalDeviceMemoryProperties for the VkPhysicalDevice that device was created
-        // from."
-        let memory_type = self
-            .device
-            .physical_device()
-            .memory_type_by_id(self.allocate.memory_type_index)
-            .ok_or(DeviceMemoryAllocError::SpecViolation(1714))?;
-
-        if self.device.physical_device().internal_object()
-            != memory_type.physical_device().internal_object()
-        {
-            return Err(DeviceMemoryAllocError::SpecViolation(1714));
-        }
-
-        // Note: This check is disabled because MoltenVK doesn't report correct heap sizes yet.
-        // This check was re-enabled because Mesa aborts if `size` is Very Large.
-        //
-        // Conversions won't panic since it's based on `vkDeviceSize`, which is a u64 in the VK
-        // header.  Not sure why we bother with usizes.
-
-        // VUID-vkAllocateMemory-pAllocateInfo-01713: "pAllocateInfo->allocationSize must be less than
-        // or equal to VkPhysicalDeviceMemoryProperties::memoryHeaps[memindex].size where memindex =
-        // VkPhysicalDeviceMemoryProperties::memoryTypes[pAllocateInfo->memoryTypeIndex].heapIndex as
-        // returned by vkGetPhysicalDeviceMemoryProperties for the VkPhysicalDevice that device was created
-        // from".
-        let reported_heap_size = memory_type.heap().size();
-        if reported_heap_size != 0 && self.allocate.allocation_size > reported_heap_size {
-            return Err(DeviceMemoryAllocError::SpecViolation(1713));
-        }
-
-        let mut export_handle_bits = ash::vk::ExternalMemoryHandleTypeFlags::empty();
-
-        if self.export_info.is_some() || self.import_info.is_some() {
-            // TODO: check exportFromImportedHandleTypes
-            export_handle_bits = match self.export_info {
-                Some(export_info) => export_info.handle_types,
-                None => ash::vk::ExternalMemoryHandleTypeFlags::empty(),
-            };
-
-            let import_handle_bits = match self.import_info {
-                Some(import_info) => import_info.handle_type,
-                None => ash::vk::ExternalMemoryHandleTypeFlags::empty(),
-            };
-
-            if !(export_handle_bits & ash::vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                .is_empty()
-            {
-                if !self.device.enabled_extensions().ext_external_memory_dma_buf {
-                    return Err(DeviceMemoryAllocError::MissingExtension(
-                        "ext_external_memory_dmabuf",
-                    ));
-                };
-            }
-
-            if !(export_handle_bits & ash::vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD).is_empty()
-            {
-                if !self.device.enabled_extensions().khr_external_memory_fd {
-                    return Err(DeviceMemoryAllocError::MissingExtension(
-                        "khr_external_memory_fd",
-                    ));
-                }
-            }
-
-            if !(import_handle_bits & ash::vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                .is_empty()
-            {
-                if !self.device.enabled_extensions().ext_external_memory_dma_buf {
-                    return Err(DeviceMemoryAllocError::MissingExtension(
-                        "ext_external_memory_dmabuf",
-                    ));
-                }
-            }
-
-            if !(import_handle_bits & ash::vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD).is_empty()
-            {
-                if !self.device.enabled_extensions().khr_external_memory_fd {
-                    return Err(DeviceMemoryAllocError::MissingExtension(
-                        "khr_external_memory_fd",
-                    ));
-                }
-            }
-        }
-
-        let memory = unsafe {
-            let physical_device = self.device.physical_device();
-            let mut allocation_count = self
-                .device
-                .allocation_count()
-                .lock()
-                .expect("Poisoned mutex");
-
-            if *allocation_count
-                >= physical_device
-                    .properties()
-                    .max_memory_allocation_count
-            {
-                return Err(DeviceMemoryAllocError::TooManyObjects);
-            }
-            let fns = self.device.fns();
-
-            let mut output = MaybeUninit::uninit();
-            check_errors(fns.v1_0.allocate_memory(
-                self.device.internal_object(),
-                &self.allocate,
-                ptr::null(),
-                output.as_mut_ptr(),
-            ))?;
-            *allocation_count += 1;
-            output.assume_init()
-        };
-
-        Ok(Arc::new(DeviceMemory {
-            memory: memory,
-            device: self.device,
-            size: self.allocate.allocation_size,
-            memory_type_index: self.allocate.memory_type_index,
-            handle_types: ExternalMemoryHandleType::from(export_handle_bits),
-            mapped: Mutex::new(false),
-        }))
-    }
+    dedicated_to: Option<DedicatedTo>,
+    export_handle_types: ExternalMemoryHandleTypes,
+    imported_handle_type: Option<ExternalMemoryHandleType>,
+    flags: MemoryAllocateFlags,
 }
 
 impl DeviceMemory {
-    /// Allocates a chunk of memory from the device.
+    /// Allocates a block of memory from the device.
     ///
     /// Some platforms may have a limit on the maximum size of a single allocation. For example,
     /// certain systems may fail to create allocations with a size greater than or equal to 4GB.
     ///
-    /// # Panic
+    /// # Panics
     ///
-    /// - Panics if `size` is 0.
-    /// - Panics if `memory_type` doesn't belong to the same physical device as `device`.
-    ///
+    /// - Panics if `allocate_info.allocation_size` is 0.
+    /// - Panics if `allocate_info.dedicated_allocation` is `Some` and the contained buffer or
+    ///   image does not belong to `device`.
     #[inline]
-    pub fn alloc(
+    pub fn allocate(
         device: Arc<Device>,
-        memory_type: MemoryType,
-        size: DeviceSize,
-    ) -> Result<DeviceMemory, DeviceMemoryAllocError> {
-        let memory = DeviceMemoryBuilder::new(device, memory_type.id(), size).build()?;
-        // Will never panic because we call the DeviceMemoryBuilder internally, and that only
-        // returns an atomically refcounted DeviceMemory object on success.
-        Ok(Arc::try_unwrap(memory).unwrap())
+        mut allocate_info: MemoryAllocateInfo<'_>,
+    ) -> Result<Self, DeviceMemoryError> {
+        Self::validate(&device, &mut allocate_info, None)?;
+
+        unsafe { Self::allocate_unchecked(device, allocate_info, None) }.map_err(Into::into)
     }
 
-    /// Same as `alloc`, but allows specifying a resource that will be bound to the memory.
+    /// Creates a new `DeviceMemory` from a raw object handle.
     ///
-    /// If a buffer or an image is specified in `resource`, then the returned memory must not be
-    /// bound to a different buffer or image.
+    /// # Safety
     ///
-    /// If the `VK_KHR_dedicated_allocation` extension is enabled on the device, then it will be
-    /// used by this method. Otherwise the `resource` parameter will be ignored.
+    /// - `handle` must be a valid Vulkan object handle created from `device`.
+    /// - `allocate_info` must match the info used to create the object.
     #[inline]
-    pub fn dedicated_alloc(
+    pub unsafe fn from_handle(
         device: Arc<Device>,
-        memory_type: MemoryType,
-        size: DeviceSize,
-        resource: DedicatedAlloc,
-    ) -> Result<DeviceMemory, DeviceMemoryAllocError> {
-        let memory = DeviceMemoryBuilder::new(device, memory_type.id(), size)
-            .dedicated_info(resource)
-            .build()?;
+        handle: ash::vk::DeviceMemory,
+        allocate_info: MemoryAllocateInfo<'_>,
+    ) -> Self {
+        let MemoryAllocateInfo {
+            allocation_size,
+            memory_type_index,
+            dedicated_allocation,
+            export_handle_types,
+            flags,
+            _ne: _,
+        } = allocate_info;
 
-        // Will never panic because we call the DeviceMemoryBuilder internally, and that only
-        // returns an atomically refcounted DeviceMemory object on success.
-        Ok(Arc::try_unwrap(memory).unwrap())
-    }
-
-    /// Allocates a chunk of memory and maps it.
-    ///
-    /// # Panic
-    ///
-    /// - Panics if `memory_type` doesn't belong to the same physical device as `device`.
-    /// - Panics if the memory type is not host-visible.
-    ///
-    #[inline]
-    pub fn alloc_and_map(
-        device: Arc<Device>,
-        memory_type: MemoryType,
-        size: DeviceSize,
-    ) -> Result<MappedDeviceMemory, DeviceMemoryAllocError> {
-        DeviceMemory::dedicated_alloc_and_map(device, memory_type, size, DedicatedAlloc::None)
-    }
-
-    /// Equivalent of `dedicated_alloc` for `alloc_and_map`.
-    pub fn dedicated_alloc_and_map(
-        device: Arc<Device>,
-        memory_type: MemoryType,
-        size: DeviceSize,
-        resource: DedicatedAlloc,
-    ) -> Result<MappedDeviceMemory, DeviceMemoryAllocError> {
-        let fns = device.fns();
-
-        assert!(memory_type.is_host_visible());
-        let mem = DeviceMemory::dedicated_alloc(device.clone(), memory_type, size, resource)?;
-
-        Self::map_allocation(device.clone(), mem)
-    }
-
-    /// Same as `alloc`, but allows exportable file descriptor on Linux.
-    #[inline]
-    #[cfg(target_os = "linux")]
-    pub fn alloc_with_exportable_fd(
-        device: Arc<Device>,
-        memory_type: MemoryType,
-        size: DeviceSize,
-    ) -> Result<DeviceMemory, DeviceMemoryAllocError> {
-        let memory = DeviceMemoryBuilder::new(device, memory_type.id(), size)
-            .export_info(ExternalMemoryHandleType {
-                opaque_fd: true,
-                ..ExternalMemoryHandleType::none()
-            })
-            .build()?;
-
-        // Will never panic because we call the DeviceMemoryBuilder internally, and that only
-        // returns an atomically refcounted DeviceMemory object on success.
-        Ok(Arc::try_unwrap(memory).unwrap())
-    }
-
-    /// Same as `dedicated_alloc`, but allows exportable file descriptor on Linux.
-    #[inline]
-    #[cfg(target_os = "linux")]
-    pub fn dedicated_alloc_with_exportable_fd(
-        device: Arc<Device>,
-        memory_type: MemoryType,
-        size: DeviceSize,
-        resource: DedicatedAlloc,
-    ) -> Result<DeviceMemory, DeviceMemoryAllocError> {
-        let memory = DeviceMemoryBuilder::new(device, memory_type.id(), size)
-            .export_info(ExternalMemoryHandleType {
-                opaque_fd: true,
-                ..ExternalMemoryHandleType::none()
-            })
-            .dedicated_info(resource)
-            .build()?;
-
-        // Will never panic because we call the DeviceMemoryBuilder internally, and that only
-        // returns an atomically refcounted DeviceMemory object on success.
-        Ok(Arc::try_unwrap(memory).unwrap())
-    }
-
-    /// Same as `alloc_and_map`, but allows exportable file descriptor on Linux.
-    #[inline]
-    #[cfg(target_os = "linux")]
-    pub fn alloc_and_map_with_exportable_fd(
-        device: Arc<Device>,
-        memory_type: MemoryType,
-        size: DeviceSize,
-    ) -> Result<MappedDeviceMemory, DeviceMemoryAllocError> {
-        DeviceMemory::dedicated_alloc_and_map_with_exportable_fd(
+        DeviceMemory {
+            handle,
             device,
-            memory_type,
-            size,
-            DedicatedAlloc::None,
-        )
+            id: Self::next_id(),
+            allocation_size,
+            memory_type_index,
+            dedicated_to: dedicated_allocation.map(Into::into),
+            export_handle_types,
+            imported_handle_type: None,
+            flags,
+        }
     }
 
-    /// Same as `dedicated_alloc_and_map`, but allows exportable file descriptor on Linux.
+    /// Imports a block of memory from an external source.
+    ///
+    /// # Safety
+    ///
+    /// - See the documentation of the variants of [`MemoryImportInfo`].
+    ///
+    /// # Panics
+    ///
+    /// - Panics if `allocate_info.allocation_size` is 0.
+    /// - Panics if `allocate_info.dedicated_allocation` is `Some` and the contained buffer or
+    ///   image does not belong to `device`.
     #[inline]
-    #[cfg(target_os = "linux")]
-    pub fn dedicated_alloc_and_map_with_exportable_fd(
+    pub unsafe fn import(
         device: Arc<Device>,
-        memory_type: MemoryType,
-        size: DeviceSize,
-        resource: DedicatedAlloc,
-    ) -> Result<MappedDeviceMemory, DeviceMemoryAllocError> {
-        let fns = device.fns();
+        mut allocate_info: MemoryAllocateInfo<'_>,
+        import_info: MemoryImportInfo,
+    ) -> Result<Self, DeviceMemoryError> {
+        Self::validate(&device, &mut allocate_info, Some(&import_info))?;
 
-        assert!(memory_type.is_host_visible());
-        let mem = DeviceMemory::dedicated_alloc_with_exportable_fd(
-            device.clone(),
-            memory_type,
-            size,
-            resource,
-        )?;
-
-        Self::map_allocation(device.clone(), mem)
+        Self::allocate_unchecked(device, allocate_info, Some(import_info)).map_err(Into::into)
     }
 
-    fn map_allocation(
+    #[inline(never)]
+    fn validate(
+        device: &Device,
+        allocate_info: &mut MemoryAllocateInfo<'_>,
+        import_info: Option<&MemoryImportInfo>,
+    ) -> Result<(), DeviceMemoryError> {
+        let &mut MemoryAllocateInfo {
+            allocation_size,
+            memory_type_index,
+            ref mut dedicated_allocation,
+            export_handle_types,
+            flags,
+            _ne: _,
+        } = allocate_info;
+
+        if !(device.api_version() >= Version::V1_1
+            || device.enabled_extensions().khr_dedicated_allocation)
+        {
+            // Fall back instead of erroring out
+            *dedicated_allocation = None;
+        }
+
+        let memory_properties = device.physical_device().memory_properties();
+
+        // VUID-vkAllocateMemory-pAllocateInfo-01714
+        let memory_type = memory_properties
+            .memory_types
+            .get(memory_type_index as usize)
+            .ok_or(DeviceMemoryError::MemoryTypeIndexOutOfRange {
+                memory_type_index,
+                memory_type_count: memory_properties.memory_types.len() as u32,
+            })?;
+
+        // VUID-VkMemoryAllocateInfo-memoryTypeIndex-01872
+        if memory_type
+            .property_flags
+            .intersects(MemoryPropertyFlags::PROTECTED)
+            && !device.enabled_features().protected_memory
+        {
+            return Err(DeviceMemoryError::RequirementNotMet {
+                required_for: "`allocate_info.memory_type_index` refers to a memory type where \
+                    `property_flags` contains `MemoryPropertyFlags::PROTECTED`",
+                requires_one_of: RequiresOneOf {
+                    features: &["protected_memory"],
+                    ..Default::default()
+                },
+            });
+        }
+
+        // VUID-VkMemoryAllocateInfo-pNext-01874
+        assert!(allocation_size != 0);
+
+        // VUID-vkAllocateMemory-pAllocateInfo-01713
+        let heap_size = memory_properties.memory_heaps[memory_type.heap_index as usize].size;
+        if heap_size != 0 && allocation_size > heap_size {
+            return Err(DeviceMemoryError::MemoryTypeHeapSizeExceeded {
+                allocation_size,
+                heap_size,
+            });
+        }
+
+        // VUID-vkAllocateMemory-deviceCoherentMemory-02790
+        if memory_type
+            .property_flags
+            .intersects(MemoryPropertyFlags::DEVICE_COHERENT)
+            && !device.enabled_features().device_coherent_memory
+        {
+            return Err(DeviceMemoryError::RequirementNotMet {
+                required_for: "`allocate_info.memory_type_index` refers to a memory type where \
+                    `property_flags` contains `MemoryPropertyFlags::DEVICE_COHERENT`",
+                requires_one_of: RequiresOneOf {
+                    features: &["device_coherent_memory"],
+                    ..Default::default()
+                },
+            });
+        }
+
+        if let Some(dedicated_allocation) = dedicated_allocation {
+            match dedicated_allocation {
+                DedicatedAllocation::Buffer(buffer) => {
+                    // VUID-VkMemoryDedicatedAllocateInfo-commonparent
+                    assert_eq!(device, buffer.device().as_ref());
+
+                    let required_size = buffer.memory_requirements().layout.size();
+
+                    // VUID-VkMemoryDedicatedAllocateInfo-buffer-02965
+                    if allocation_size != required_size {
+                        return Err(DeviceMemoryError::DedicatedAllocationSizeMismatch {
+                            allocation_size,
+                            required_size,
+                        });
+                    }
+                }
+                DedicatedAllocation::Image(image) => {
+                    // VUID-VkMemoryDedicatedAllocateInfo-commonparent
+                    assert_eq!(device, image.device().as_ref());
+
+                    let required_size = image.memory_requirements()[0].layout.size();
+
+                    // VUID-VkMemoryDedicatedAllocateInfo-image-02964
+                    if allocation_size != required_size {
+                        return Err(DeviceMemoryError::DedicatedAllocationSizeMismatch {
+                            allocation_size,
+                            required_size,
+                        });
+                    }
+                }
+            }
+        }
+
+        if !export_handle_types.is_empty() {
+            if !(device.api_version() >= Version::V1_1
+                || device.enabled_extensions().khr_external_memory)
+            {
+                return Err(DeviceMemoryError::RequirementNotMet {
+                    required_for: "`allocate_info.export_handle_types` is not empty",
+                    requires_one_of: RequiresOneOf {
+                        api_version: Some(Version::V1_1),
+                        device_extensions: &["khr_external_memory"],
+                        ..Default::default()
+                    },
+                });
+            }
+
+            // VUID-VkExportMemoryAllocateInfo-handleTypes-parameter
+            export_handle_types.validate_device(device)?;
+
+            // VUID-VkMemoryAllocateInfo-pNext-00639
+            // VUID-VkExportMemoryAllocateInfo-handleTypes-00656
+            // TODO: how do you fullfill this when you don't know the image or buffer parameters?
+            // Does exporting memory require specifying these parameters up front, and does it tie
+            // the allocation to only images or buffers of that type?
+        }
+
+        if let Some(import_info) = import_info {
+            match *import_info {
+                MemoryImportInfo::Fd {
+                    #[cfg(unix)]
+                    handle_type,
+                    #[cfg(not(unix))]
+                        handle_type: _,
+                    file: _,
+                } => {
+                    if !device.enabled_extensions().khr_external_memory_fd {
+                        return Err(DeviceMemoryError::RequirementNotMet {
+                            required_for: "`allocate_info.import_info` is \
+                                `Some(MemoryImportInfo::Fd)`",
+                            requires_one_of: RequiresOneOf {
+                                device_extensions: &["khr_external_memory_fd"],
+                                ..Default::default()
+                            },
+                        });
+                    }
+
+                    #[cfg(not(unix))]
+                    unreachable!(
+                        "`khr_external_memory_fd` was somehow enabled on a non-Unix system"
+                    );
+
+                    #[cfg(unix)]
+                    {
+                        // VUID-VkImportMemoryFdInfoKHR-handleType-parameter
+                        handle_type.validate_device(device)?;
+
+                        // VUID-VkImportMemoryFdInfoKHR-handleType-00669
+                        match handle_type {
+                            ExternalMemoryHandleType::OpaqueFd => {
+                                // VUID-VkMemoryAllocateInfo-allocationSize-01742
+                                // Can't validate, must be ensured by user
+
+                                // VUID-VkMemoryDedicatedAllocateInfo-buffer-01879
+                                // Can't validate, must be ensured by user
+
+                                // VUID-VkMemoryDedicatedAllocateInfo-image-01878
+                                // Can't validate, must be ensured by user
+                            }
+                            ExternalMemoryHandleType::DmaBuf => {}
+                            _ => {
+                                return Err(DeviceMemoryError::ImportFdHandleTypeNotSupported {
+                                    handle_type,
+                                })
+                            }
+                        }
+
+                        // VUID-VkMemoryAllocateInfo-memoryTypeIndex-00648
+                        // Can't validate, must be ensured by user
+                    }
+                }
+                MemoryImportInfo::Win32 {
+                    #[cfg(windows)]
+                    handle_type,
+                    #[cfg(not(windows))]
+                        handle_type: _,
+                    handle: _,
+                } => {
+                    if !device.enabled_extensions().khr_external_memory_win32 {
+                        return Err(DeviceMemoryError::RequirementNotMet {
+                            required_for: "`allocate_info.import_info` is \
+                                `Some(MemoryImportInfo::Win32)`",
+                            requires_one_of: RequiresOneOf {
+                                device_extensions: &["khr_external_memory_win32"],
+                                ..Default::default()
+                            },
+                        });
+                    }
+
+                    #[cfg(not(windows))]
+                    unreachable!(
+                        "`khr_external_memory_win32` was somehow enabled on a non-Windows system"
+                    );
+
+                    #[cfg(windows)]
+                    {
+                        // VUID-VkImportMemoryWin32HandleInfoKHR-handleType-parameter
+                        handle_type.validate_device(device)?;
+
+                        // VUID-VkImportMemoryWin32HandleInfoKHR-handleType-00660
+                        match handle_type {
+                            ExternalMemoryHandleType::OpaqueWin32
+                            | ExternalMemoryHandleType::OpaqueWin32Kmt => {
+                                // VUID-VkMemoryAllocateInfo-allocationSize-01742
+                                // Can't validate, must be ensured by user
+
+                                // VUID-VkMemoryDedicatedAllocateInfo-buffer-01879
+                                // Can't validate, must be ensured by user
+
+                                // VUID-VkMemoryDedicatedAllocateInfo-image-01878
+                                // Can't validate, must be ensured by user
+                            }
+                            _ => {
+                                return Err(DeviceMemoryError::ImportWin32HandleTypeNotSupported {
+                                    handle_type,
+                                })
+                            }
+                        }
+
+                        // VUID-VkMemoryAllocateInfo-memoryTypeIndex-00645
+                        // Can't validate, must be ensured by user
+                    }
+                }
+            }
+        }
+
+        if !flags.is_empty()
+            && device.physical_device().api_version() < Version::V1_1
+            && !device.enabled_extensions().khr_device_group
+        {
+            return Err(DeviceMemoryError::RequirementNotMet {
+                required_for: "`allocate_info.flags` is not empty",
+                requires_one_of: RequiresOneOf {
+                    api_version: Some(Version::V1_1),
+                    device_extensions: &["khr_device_group"],
+                    ..Default::default()
+                },
+            });
+        }
+
+        if flags.intersects(MemoryAllocateFlags::DEVICE_ADDRESS) {
+            // VUID-VkMemoryAllocateInfo-flags-03331
+            if !device.enabled_features().buffer_device_address {
+                return Err(DeviceMemoryError::RequirementNotMet {
+                    required_for: "`allocate_info.flags` contains \
+                        `MemoryAllocateFlags::DEVICE_ADDRESS`",
+                    requires_one_of: RequiresOneOf {
+                        features: &["buffer_device_address"],
+                        ..Default::default()
+                    },
+                });
+            }
+
+            if device.enabled_extensions().ext_buffer_device_address {
+                return Err(DeviceMemoryError::RequirementNotMet {
+                    required_for: "`allocate_info.flags` contains \
+                        `MemoryAllocateFlags::DEVICE_ADDRESS`",
+                    requires_one_of: RequiresOneOf {
+                        api_version: Some(Version::V1_2),
+                        device_extensions: &["khr_buffer_device_address"],
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "document_unchecked"), doc(hidden))]
+    #[inline(never)]
+    pub unsafe fn allocate_unchecked(
         device: Arc<Device>,
-        mem: DeviceMemory,
-    ) -> Result<MappedDeviceMemory, DeviceMemoryAllocError> {
-        let fns = device.fns();
-        let coherent = mem.memory_type().is_host_coherent();
-        let ptr = unsafe {
+        allocate_info: MemoryAllocateInfo<'_>,
+        import_info: Option<MemoryImportInfo>,
+    ) -> Result<Self, VulkanError> {
+        let MemoryAllocateInfo {
+            allocation_size,
+            memory_type_index,
+            dedicated_allocation,
+            export_handle_types,
+            flags,
+            _ne: _,
+        } = allocate_info;
+
+        let mut allocate_info = ash::vk::MemoryAllocateInfo::builder()
+            .allocation_size(allocation_size)
+            .memory_type_index(memory_type_index);
+
+        // VUID-VkMemoryDedicatedAllocateInfo-image-01432
+        let mut dedicated_allocate_info =
+            dedicated_allocation.map(|dedicated_allocation| match dedicated_allocation {
+                DedicatedAllocation::Buffer(buffer) => ash::vk::MemoryDedicatedAllocateInfo {
+                    buffer: buffer.handle(),
+                    ..Default::default()
+                },
+                DedicatedAllocation::Image(image) => ash::vk::MemoryDedicatedAllocateInfo {
+                    image: image.handle(),
+                    ..Default::default()
+                },
+            });
+
+        if let Some(info) = dedicated_allocate_info.as_mut() {
+            allocate_info = allocate_info.push_next(info);
+        }
+
+        let mut export_allocate_info = if !export_handle_types.is_empty() {
+            Some(ash::vk::ExportMemoryAllocateInfo {
+                handle_types: export_handle_types.into(),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
+        if let Some(info) = export_allocate_info.as_mut() {
+            allocate_info = allocate_info.push_next(info);
+        }
+
+        let imported_handle_type = import_info.as_ref().map(|import_info| match import_info {
+            MemoryImportInfo::Fd { handle_type, .. } => *handle_type,
+            MemoryImportInfo::Win32 { handle_type, .. } => *handle_type,
+        });
+
+        #[cfg(unix)]
+        let mut import_fd_info = match import_info {
+            Some(MemoryImportInfo::Fd { handle_type, file }) => {
+                use std::os::unix::io::IntoRawFd;
+
+                Some(ash::vk::ImportMemoryFdInfoKHR {
+                    handle_type: handle_type.into(),
+                    fd: file.into_raw_fd(),
+                    ..Default::default()
+                })
+            }
+            _ => None,
+        };
+
+        #[cfg(unix)]
+        if let Some(info) = import_fd_info.as_mut() {
+            allocate_info = allocate_info.push_next(info);
+        }
+
+        #[cfg(windows)]
+        let mut import_win32_handle_info = match import_info {
+            Some(MemoryImportInfo::Win32 {
+                handle_type,
+                handle,
+            }) => Some(ash::vk::ImportMemoryWin32HandleInfoKHR {
+                handle_type: handle_type.into(),
+                handle,
+                ..Default::default()
+            }),
+            _ => None,
+        };
+
+        #[cfg(windows)]
+        if let Some(info) = import_win32_handle_info.as_mut() {
+            allocate_info = allocate_info.push_next(info);
+        }
+
+        let mut flags_info = ash::vk::MemoryAllocateFlagsInfo {
+            flags: flags.into(),
+            ..Default::default()
+        };
+
+        if !flags.is_empty() {
+            allocate_info = allocate_info.push_next(&mut flags_info);
+        }
+
+        // VUID-vkAllocateMemory-maxMemoryAllocationCount-04101
+        let max_allocations = device
+            .physical_device()
+            .properties()
+            .max_memory_allocation_count;
+        device
+            .allocation_count
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, move |count| {
+                (count < max_allocations).then_some(count + 1)
+            })
+            .map_err(|_| VulkanError::TooManyObjects)?;
+
+        let handle = {
+            let fns = device.fns();
             let mut output = MaybeUninit::uninit();
-            check_errors(fns.v1_0.map_memory(
-                device.internal_object(),
-                mem.memory,
-                0,
-                mem.size,
-                ash::vk::MemoryMapFlags::empty(),
+            (fns.v1_0.allocate_memory)(
+                device.handle(),
+                &allocate_info.build(),
+                ptr::null(),
                 output.as_mut_ptr(),
-            ))?;
+            )
+            .result()
+            .map_err(|e| {
+                device.allocation_count.fetch_sub(1, Ordering::Release);
+                VulkanError::from(e)
+            })?;
+
             output.assume_init()
         };
 
-        Ok(MappedDeviceMemory {
-            memory: mem,
-            pointer: ptr,
-            coherent,
+        Ok(DeviceMemory {
+            handle,
+            device,
+            id: Self::next_id(),
+            allocation_size,
+            memory_type_index,
+            dedicated_to: dedicated_allocation.map(Into::into),
+            export_handle_types,
+            imported_handle_type,
+            flags,
         })
     }
 
-    /// Returns the memory type this chunk was allocated on.
+    /// Returns the index of the memory type that this memory was allocated from.
     #[inline]
-    pub fn memory_type(&self) -> MemoryType {
-        self.device
-            .physical_device()
-            .memory_type_by_id(self.memory_type_index)
-            .unwrap()
+    pub fn memory_type_index(&self) -> u32 {
+        self.memory_type_index
     }
 
-    /// Returns the size in bytes of that memory chunk.
+    /// Returns the size in bytes of the memory allocation.
     #[inline]
-    pub fn size(&self) -> DeviceSize {
-        self.size
+    pub fn allocation_size(&self) -> DeviceSize {
+        self.allocation_size
     }
 
-    /// Exports the device memory into a Unix file descriptor.  The caller retains ownership of the
-    /// file, as per the Vulkan spec.
+    /// Returns `true` if the memory is a [dedicated] to a resource.
     ///
-    /// # Panic
+    /// [dedicated]: MemoryAllocateInfo#structfield.dedicated_allocation
+    #[inline]
+    pub fn is_dedicated(&self) -> bool {
+        self.dedicated_to.is_some()
+    }
+
+    pub(crate) fn dedicated_to(&self) -> Option<DedicatedTo> {
+        self.dedicated_to
+    }
+
+    /// Returns the handle types that can be exported from the memory allocation.
+    #[inline]
+    pub fn export_handle_types(&self) -> ExternalMemoryHandleTypes {
+        self.export_handle_types
+    }
+
+    /// Returns the handle type that the memory allocation was imported from, if any.
+    #[inline]
+    pub fn imported_handle_type(&self) -> Option<ExternalMemoryHandleType> {
+        self.imported_handle_type
+    }
+
+    /// Returns the flags the memory was allocated with.
+    #[inline]
+    pub fn flags(&self) -> MemoryAllocateFlags {
+        self.flags
+    }
+
+    /// Retrieves the amount of lazily-allocated memory that is currently commited to this
+    /// memory object.
+    ///
+    /// The device may change this value at any time, and the returned value may be
+    /// already out-of-date.
+    ///
+    /// `self` must have been allocated from a memory type that has the [`LAZILY_ALLOCATED`] flag
+    /// set.
+    ///
+    /// [`LAZILY_ALLOCATED`]: crate::memory::MemoryPropertyFlags::LAZILY_ALLOCATED
+    #[inline]
+    pub fn commitment(&self) -> Result<DeviceSize, DeviceMemoryError> {
+        self.validate_commitment()?;
+
+        unsafe { Ok(self.commitment_unchecked()) }
+    }
+
+    fn validate_commitment(&self) -> Result<(), DeviceMemoryError> {
+        let memory_type = &self
+            .device
+            .physical_device()
+            .memory_properties()
+            .memory_types[self.memory_type_index as usize];
+
+        // VUID-vkGetDeviceMemoryCommitment-memory-00690
+        if !memory_type
+            .property_flags
+            .intersects(MemoryPropertyFlags::LAZILY_ALLOCATED)
+        {
+            return Err(DeviceMemoryError::NotLazilyAllocated);
+        }
+
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "document_unchecked"), doc(hidden))]
+    #[inline]
+    pub unsafe fn commitment_unchecked(&self) -> DeviceSize {
+        let mut output: DeviceSize = 0;
+
+        let fns = self.device.fns();
+        (fns.v1_0.get_device_memory_commitment)(self.device.handle(), self.handle, &mut output);
+
+        output
+    }
+
+    /// Exports the device memory into a Unix file descriptor. The caller owns the returned `File`.
+    ///
+    /// # Panics
     ///
     /// - Panics if the user requests an invalid handle type for this device memory object.
     #[inline]
-    #[cfg(any(target_os = "android", target_os = "linux"))]
     pub fn export_fd(
         &self,
         handle_type: ExternalMemoryHandleType,
-    ) -> Result<File, DeviceMemoryAllocError> {
-        let fns = self.device.fns();
+    ) -> Result<std::fs::File, DeviceMemoryError> {
+        // VUID-VkMemoryGetFdInfoKHR-handleType-parameter
+        handle_type.validate_device(&self.device)?;
 
-        // VUID-VkMemoryGetFdInfoKHR-handleType-00672: "handleType must be defined as a POSIX file
-        // descriptor handle".
-        let bits = ash::vk::ExternalMemoryHandleTypeFlags::from(handle_type);
-        if bits != ash::vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT
-            && bits != ash::vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD
+        // VUID-VkMemoryGetFdInfoKHR-handleType-00672
+        if !matches!(
+            handle_type,
+            ExternalMemoryHandleType::OpaqueFd | ExternalMemoryHandleType::DmaBuf
+        ) {
+            return Err(DeviceMemoryError::HandleTypeNotSupported { handle_type });
+        }
+
+        // VUID-VkMemoryGetFdInfoKHR-handleType-00671
+        if !ash::vk::ExternalMemoryHandleTypeFlags::from(self.export_handle_types)
+            .intersects(ash::vk::ExternalMemoryHandleTypeFlags::from(handle_type))
         {
-            return Err(DeviceMemoryAllocError::SpecViolation(672))?;
+            return Err(DeviceMemoryError::HandleTypeNotSupported { handle_type });
         }
 
-        // VUID-VkMemoryGetFdInfoKHR-handleType-00671: "handleType must have been included in
-        // VkExportMemoryAllocateInfo::handleTypes when memory was created".
-        if (bits & ash::vk::ExternalMemoryHandleTypeFlags::from(self.handle_types)).is_empty() {
-            return Err(DeviceMemoryAllocError::SpecViolation(671))?;
-        }
+        debug_assert!(self.device().enabled_extensions().khr_external_memory_fd);
 
-        let fd = unsafe {
-            let info = ash::vk::MemoryGetFdInfoKHR {
-                memory: self.memory,
-                handle_type: handle_type.into(),
-                ..Default::default()
+        #[cfg(not(unix))]
+        unreachable!("`khr_external_memory_fd` was somehow enabled on a non-Unix system");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::FromRawFd;
+
+            let fd = unsafe {
+                let fns = self.device.fns();
+                let info = ash::vk::MemoryGetFdInfoKHR {
+                    memory: self.handle,
+                    handle_type: handle_type.into(),
+                    ..Default::default()
+                };
+
+                let mut output = MaybeUninit::uninit();
+                (fns.khr_external_memory_fd.get_memory_fd_khr)(
+                    self.device.handle(),
+                    &info,
+                    output.as_mut_ptr(),
+                )
+                .result()
+                .map_err(VulkanError::from)?;
+                output.assume_init()
             };
 
-            let mut output = MaybeUninit::uninit();
-            check_errors(fns.khr_external_memory_fd.get_memory_fd_khr(
-                self.device.internal_object(),
-                &info,
-                output.as_mut_ptr(),
-            ))?;
-            output.assume_init()
-        };
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
 
-        let file = unsafe { File::from_raw_fd(fd) };
-        Ok(file)
+            Ok(file)
+        }
+    }
+}
+
+impl Drop for DeviceMemory {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe {
+            let fns = self.device.fns();
+            (fns.v1_0.free_memory)(self.device.handle(), self.handle, ptr::null());
+            self.device.allocation_count.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+unsafe impl VulkanObject for DeviceMemory {
+    type Handle = ash::vk::DeviceMemory;
+
+    #[inline]
+    fn handle(&self) -> Self::Handle {
+        self.handle
     }
 }
 
@@ -626,74 +748,447 @@ unsafe impl DeviceOwned for DeviceMemory {
     }
 }
 
-impl fmt::Debug for DeviceMemory {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_struct("DeviceMemory")
-            .field("device", &*self.device)
-            .field("memory_type", &self.memory_type())
-            .field("size", &self.size)
-            .finish()
-    }
+impl_id_counter!(DeviceMemory);
+
+/// Parameters to allocate a new `DeviceMemory`.
+#[derive(Clone, Debug)]
+pub struct MemoryAllocateInfo<'d> {
+    /// The number of bytes to allocate.
+    ///
+    /// The default value is `0`, which must be overridden.
+    pub allocation_size: DeviceSize,
+
+    /// The index of the memory type that should be allocated.
+    ///
+    /// The default value is [`u32::MAX`], which must be overridden.
+    pub memory_type_index: u32,
+
+    /// Allocates memory for a specific buffer or image.
+    ///
+    /// This value is silently ignored (treated as `None`) if the device API version is less than
+    /// 1.1 and the
+    /// [`khr_dedicated_allocation`](crate::device::DeviceExtensions::khr_dedicated_allocation)
+    /// extension is not enabled on the device.
+    pub dedicated_allocation: Option<DedicatedAllocation<'d>>,
+
+    /// The handle types that can be exported from the allocated memory.
+    pub export_handle_types: ExternalMemoryHandleTypes,
+
+    /// Additional flags for the memory allocation.
+    ///
+    /// If not empty, the device API version must be at least 1.1, or the
+    /// [`khr_device_group`](crate::device::DeviceExtensions::khr_device_group) extension must be
+    /// enabled on the device.
+    ///
+    /// The default value is [`MemoryAllocateFlags::empty()`].
+    pub flags: MemoryAllocateFlags,
+
+    pub _ne: crate::NonExhaustive,
 }
 
-unsafe impl VulkanObject for DeviceMemory {
-    type Object = ash::vk::DeviceMemory;
-
+impl Default for MemoryAllocateInfo<'static> {
     #[inline]
-    fn internal_object(&self) -> ash::vk::DeviceMemory {
-        self.memory
-    }
-}
-
-impl Drop for DeviceMemory {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            let fns = self.device.fns();
-            fns.v1_0
-                .free_memory(self.device.internal_object(), self.memory, ptr::null());
-            let mut allocation_count = self
-                .device
-                .allocation_count()
-                .lock()
-                .expect("Poisoned mutex");
-            *allocation_count -= 1;
+    fn default() -> Self {
+        Self {
+            allocation_size: 0,
+            memory_type_index: u32::MAX,
+            dedicated_allocation: None,
+            export_handle_types: ExternalMemoryHandleTypes::empty(),
+            flags: MemoryAllocateFlags::empty(),
+            _ne: crate::NonExhaustive(()),
         }
     }
 }
 
-/// Represents memory that has been allocated and mapped in CPU accessible space.
+impl<'d> MemoryAllocateInfo<'d> {
+    /// Returns a `MemoryAllocateInfo` with the specified `dedicated_allocation`.
+    #[inline]
+    pub fn dedicated_allocation(dedicated_allocation: DedicatedAllocation<'d>) -> Self {
+        Self {
+            allocation_size: 0,
+            memory_type_index: u32::MAX,
+            dedicated_allocation: Some(dedicated_allocation),
+            export_handle_types: ExternalMemoryHandleTypes::empty(),
+            flags: MemoryAllocateFlags::empty(),
+            _ne: crate::NonExhaustive(()),
+        }
+    }
+}
+
+/// Parameters to import memory from an external source.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum MemoryImportInfo {
+    /// Import memory from a Unix file descriptor.
+    ///
+    /// `handle_type` must be either [`ExternalMemoryHandleType::OpaqueFd`] or
+    /// [`ExternalMemoryHandleType::DmaBuf`].
+    ///
+    /// # Safety
+    ///
+    /// - `file` must be a valid Unix file descriptor.
+    /// - Vulkan will take ownership of `file`, and once the memory is imported, you must not
+    ///   perform any operations on `file` nor on any of its clones/duplicates.
+    /// - If `file` was created by the Vulkan API, and `handle_type` is
+    ///   [`ExternalMemoryHandleType::OpaqueFd`]:
+    ///   - [`MemoryAllocateInfo::allocation_size`] and [`MemoryAllocateInfo::memory_type_index`]
+    ///     must match those of the original memory allocation.
+    ///   - If the original memory allocation used [`MemoryAllocateInfo::dedicated_allocation`],
+    ///     the imported one must also use it, and the associated buffer or image must be defined
+    ///     identically to the original.
+    /// - If `file` was not created by the Vulkan API, then
+    ///   [`MemoryAllocateInfo::memory_type_index`] must be one of the memory types returned by
+    ///   [`Device::memory_fd_properties`].
+    Fd {
+        handle_type: ExternalMemoryHandleType,
+        file: File,
+    },
+
+    /// Import memory from a Windows handle.
+    ///
+    /// `handle_type` must be either [`ExternalMemoryHandleType::OpaqueWin32`] or
+    /// [`ExternalMemoryHandleType::OpaqueWin32Kmt`].
+    ///
+    /// # Safety
+    ///
+    /// - `handle` must be a valid Windows handle.
+    /// - Vulkan will not take ownership of `handle`.
+    /// - If `handle_type` is [`ExternalMemoryHandleType::OpaqueWin32`], it owns a reference
+    ///   to the underlying resource and must eventually be closed by the caller.
+    /// - If `handle_type` is [`ExternalMemoryHandleType::OpaqueWin32Kmt`], it does not own a
+    ///   reference to the underlying resource.
+    /// - `handle` must be created by the Vulkan API.
+    /// - [`MemoryAllocateInfo::allocation_size`] and [`MemoryAllocateInfo::memory_type_index`]
+    ///   must match those of the original memory allocation.
+    /// - If the original memory allocation used [`MemoryAllocateInfo::dedicated_allocation`],
+    ///   the imported one must also use it, and the associated buffer or image must be defined
+    ///   identically to the original.
+    Win32 {
+        handle_type: ExternalMemoryHandleType,
+        handle: ash::vk::HANDLE,
+    },
+}
+
+vulkan_bitflags_enum! {
+    #[non_exhaustive]
+
+    /// A set of [`ExternalMemoryHandleType`] values.
+    ExternalMemoryHandleTypes,
+
+    /// A handle type used to export or import memory to/from an external source.
+    ExternalMemoryHandleType,
+
+    = ExternalMemoryHandleTypeFlags(u32);
+
+    /// A POSIX file descriptor handle that is only usable with Vulkan and compatible APIs.
+    OPAQUE_FD, OpaqueFd = OPAQUE_FD,
+
+    /// A Windows NT handle that is only usable with Vulkan and compatible APIs.
+    OPAQUE_WIN32, OpaqueWin32 = OPAQUE_WIN32,
+
+    /// A Windows global share handle that is only usable with Vulkan and compatible APIs.
+    OPAQUE_WIN32_KMT, OpaqueWin32Kmt = OPAQUE_WIN32_KMT,
+
+    /// A Windows NT handle that refers to a Direct3D 10 or 11 texture resource.
+    D3D11_TEXTURE, D3D11Texture = D3D11_TEXTURE,
+
+    /// A Windows global share handle that refers to a Direct3D 10 or 11 texture resource.
+    D3D11_TEXTURE_KMT, D3D11TextureKmt = D3D11_TEXTURE_KMT,
+
+    /// A Windows NT handle that refers to a Direct3D 12 heap resource.
+    D3D12_HEAP, D3D12Heap = D3D12_HEAP,
+
+    /// A Windows NT handle that refers to a Direct3D 12 committed resource.
+    D3D12_RESOURCE, D3D12Resource = D3D12_RESOURCE,
+
+    /// A POSIX file descriptor handle that refers to a Linux dma-buf.
+    DMA_BUF, DmaBuf = DMA_BUF_EXT {
+        device_extensions: [ext_external_memory_dma_buf],
+    },
+
+    /// A handle for an Android `AHardwareBuffer` object.
+    ANDROID_HARDWARE_BUFFER, AndroidHardwareBuffer = ANDROID_HARDWARE_BUFFER_ANDROID {
+        device_extensions: [android_external_memory_android_hardware_buffer],
+    },
+
+    /// A pointer to memory that was allocated by the host.
+    HOST_ALLOCATION, HostAllocation = HOST_ALLOCATION_EXT {
+        device_extensions: [ext_external_memory_host],
+    },
+
+    /// A pointer to a memory mapping on the host that maps non-host memory.
+    HOST_MAPPED_FOREIGN_MEMORY, HostMappedForeignMemory = HOST_MAPPED_FOREIGN_MEMORY_EXT {
+        device_extensions: [ext_external_memory_host],
+    },
+
+    /// A Zircon handle to a virtual memory object.
+    ZIRCON_VMO, ZirconVmo = ZIRCON_VMO_FUCHSIA {
+        device_extensions: [fuchsia_external_memory],
+    },
+
+    /// A Remote Direct Memory Address handle to an allocation that is accessible by remote devices.
+    RDMA_ADDRESS, RdmaAddress = RDMA_ADDRESS_NV {
+        device_extensions: [nv_external_memory_rdma],
+    },
+}
+
+vulkan_bitflags! {
+    #[non_exhaustive]
+
+    /// A mask specifying flags for device memory allocation.
+    MemoryAllocateFlags = MemoryAllocateFlags(u32);
+
+    /* TODO: enable
+    DEVICE_MASK = DEVICE_MASK,*/
+
+    /// Specifies that the allocated device memory can be bound to a buffer created with the
+    /// [`SHADER_DEVICE_ADDRESS`] usage. This requires that the [`buffer_device_address`] feature
+    /// is enabled on the device and the [`ext_buffer_device_address`] extension is not enabled on
+    /// the device.
+    ///
+    /// [`SHADER_DEVICE_ADDRESS`]: crate::buffer::BufferUsage::SHADER_DEVICE_ADDRESS
+    /// [`buffer_device_address`]: crate::device::Features::buffer_device_address
+    /// [`ext_buffer_device_address`]: crate::device::DeviceExtensions::ext_buffer_device_address
+    DEVICE_ADDRESS = DEVICE_ADDRESS,
+
+    /* TODO: enable
+    DEVICE_ADDRESS_CAPTURE_REPLAY = DEVICE_ADDRESS_CAPTURE_REPLAY,*/
+}
+
+/// Error type returned by functions related to `DeviceMemory`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceMemoryError {
+    /// Not enough memory available.
+    OomError(OomError),
+
+    /// The maximum number of allocations has been exceeded.
+    TooManyObjects,
+
+    /// An error occurred when mapping the memory.
+    MemoryMapError(MemoryMapError),
+
+    RequirementNotMet {
+        required_for: &'static str,
+        requires_one_of: RequiresOneOf,
+    },
+
+    /// `dedicated_allocation` was `Some`, but the provided `allocation_size`  was different from
+    /// the required size of the buffer or image.
+    DedicatedAllocationSizeMismatch {
+        allocation_size: DeviceSize,
+        required_size: DeviceSize,
+    },
+
+    /// The requested export handle type is not supported for this operation, or was not provided in
+    /// `export_handle_types` when allocating the memory.
+    HandleTypeNotSupported {
+        handle_type: ExternalMemoryHandleType,
+    },
+
+    /// The provided `MemoryImportInfo::Fd::handle_type` is not supported for file descriptors.
+    ImportFdHandleTypeNotSupported {
+        handle_type: ExternalMemoryHandleType,
+    },
+
+    /// The provided `MemoryImportInfo::Win32::handle_type` is not supported.
+    ImportWin32HandleTypeNotSupported {
+        handle_type: ExternalMemoryHandleType,
+    },
+
+    /// The provided `allocation_size` was greater than the memory type's heap size.
+    MemoryTypeHeapSizeExceeded {
+        allocation_size: DeviceSize,
+        heap_size: DeviceSize,
+    },
+
+    /// The provided `memory_type_index` was not less than the number of memory types in the
+    /// physical device.
+    MemoryTypeIndexOutOfRange {
+        memory_type_index: u32,
+        memory_type_count: u32,
+    },
+
+    /// The memory type from which this memory was allocated does not have the [`LAZILY_ALLOCATED`]
+    /// flag set.
+    ///
+    /// [`LAZILY_ALLOCATED`]: crate::memory::MemoryPropertyFlags::LAZILY_ALLOCATED
+    NotLazilyAllocated,
+
+    /// Spec violation, containing the Valid Usage ID (VUID) from the Vulkan spec.
+    // TODO: Remove
+    SpecViolation(u32),
+
+    /// An implicit violation that's convered in the Vulkan spec.
+    // TODO: Remove
+    ImplicitSpecViolation(&'static str),
+}
+
+impl Error for DeviceMemoryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::OomError(err) => Some(err),
+            Self::MemoryMapError(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl Display for DeviceMemoryError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
+        match self {
+            Self::OomError(_) => write!(f, "not enough memory available"),
+            Self::TooManyObjects => {
+                write!(f, "the maximum number of allocations has been exceeded")
+            }
+            Self::MemoryMapError(_) => write!(f, "error occurred when mapping the memory"),
+            Self::RequirementNotMet {
+                required_for,
+                requires_one_of,
+            } => write!(
+                f,
+                "a requirement was not met for: {}; requires one of: {}",
+                required_for, requires_one_of,
+            ),
+            Self::DedicatedAllocationSizeMismatch {
+                allocation_size,
+                required_size,
+            } => write!(
+                f,
+                "`dedicated_allocation` was `Some`, but the provided `allocation_size` ({}) was \
+                different from the required size of the buffer or image ({})",
+                allocation_size, required_size,
+            ),
+            Self::HandleTypeNotSupported { handle_type } => write!(
+                f,
+                "the requested export handle type ({:?}) is not supported for this operation, or \
+                was not provided in `export_handle_types` when allocating the memory",
+                handle_type,
+            ),
+            Self::ImportFdHandleTypeNotSupported { handle_type } => write!(
+                f,
+                "the provided `MemoryImportInfo::Fd::handle_type` ({:?}) is not supported for file \
+                descriptors",
+                handle_type,
+            ),
+            Self::ImportWin32HandleTypeNotSupported { handle_type } => write!(
+                f,
+                "the provided `MemoryImportInfo::Win32::handle_type` ({:?}) is not supported",
+                handle_type,
+            ),
+            Self::MemoryTypeHeapSizeExceeded {
+                allocation_size,
+                heap_size,
+            } => write!(
+                f,
+                "the provided `allocation_size` ({}) was greater than the memory type's heap size \
+                ({})",
+                allocation_size, heap_size,
+            ),
+            Self::MemoryTypeIndexOutOfRange {
+                memory_type_index,
+                memory_type_count,
+            } => write!(
+                f,
+                "the provided `memory_type_index` ({}) was not less than the number of memory \
+                types in the physical device ({})",
+                memory_type_index, memory_type_count,
+            ),
+            Self::NotLazilyAllocated => write!(
+                f,
+                "the memory type from which this memory was allocated does not have the \
+                `lazily_allocated` flag set",
+            ),
+
+            Self::SpecViolation(u) => {
+                write!(f, "valid usage ID check {} failed", u)
+            }
+            Self::ImplicitSpecViolation(e) => {
+                write!(f, "Implicit spec violation failed {}", e)
+            }
+        }
+    }
+}
+
+impl From<VulkanError> for DeviceMemoryError {
+    fn from(err: VulkanError) -> Self {
+        match err {
+            e @ VulkanError::OutOfHostMemory | e @ VulkanError::OutOfDeviceMemory => {
+                Self::OomError(e.into())
+            }
+            VulkanError::TooManyObjects => Self::TooManyObjects,
+            _ => panic!("unexpected error: {:?}", err),
+        }
+    }
+}
+
+impl From<OomError> for DeviceMemoryError {
+    fn from(err: OomError) -> Self {
+        Self::OomError(err)
+    }
+}
+
+impl From<MemoryMapError> for DeviceMemoryError {
+    fn from(err: MemoryMapError) -> Self {
+        Self::MemoryMapError(err)
+    }
+}
+
+impl From<RequirementNotMet> for DeviceMemoryError {
+    fn from(err: RequirementNotMet) -> Self {
+        Self::RequirementNotMet {
+            required_for: err.required_for,
+            requires_one_of: err.requires_one_of,
+        }
+    }
+}
+
+/// Represents device memory that has been mapped in a CPU-accessible space.
 ///
-/// Can be obtained with `DeviceMemory::alloc_and_map`. The function will panic if the memory type
-/// is not host-accessible.
+/// In order to access the contents of the allocated memory, you can use the `read` and `write`
+/// methods.
 ///
-/// In order to access the content of the allocated memory, you can use the `read_write` method.
-/// This method returns a guard object that derefs to the content.
-///
-/// # Example
+/// # Examples
 ///
 /// ```
-/// use vulkano::memory::DeviceMemory;
+/// use vulkano::memory::{DeviceMemory, MappedDeviceMemory, MemoryAllocateInfo, MemoryPropertyFlags};
 ///
 /// # let device: std::sync::Arc<vulkano::device::Device> = return;
 /// // The memory type must be mappable.
-/// let mem_ty = device.physical_device().memory_types()
-///                     .filter(|t| t.is_host_visible())
-///                     .next().unwrap();    // Vk specs guarantee that this can't fail
+/// let memory_type_index = device
+///     .physical_device()
+///     .memory_properties()
+///     .memory_types
+///     .iter()
+///     .position(|t| t.property_flags.intersects(MemoryPropertyFlags::HOST_VISIBLE))
+///     .map(|i| i as u32)
+///     .unwrap(); // Vk specs guarantee that this can't fail
 ///
 /// // Allocates 1KB of memory.
-/// let memory = DeviceMemory::alloc_and_map(device.clone(), mem_ty, 1024).unwrap();
+/// let memory = DeviceMemory::allocate(
+///     device.clone(),
+///     MemoryAllocateInfo {
+///         allocation_size: 1024,
+///         memory_type_index,
+///         ..Default::default()
+///     },
+/// )
+/// .unwrap();
+/// let mapped_memory = MappedDeviceMemory::new(memory, 0..1024).unwrap();
 ///
-/// // Get access to the content. Note that this is very unsafe for two reasons: 1) the content is
-/// // uninitialized, and 2) the access is unsynchronized.
+/// // Get access to the content.
+/// // Note that this is very unsafe because the access is unsynchronized.
 /// unsafe {
-///     let mut content = memory.read_write::<[u8]>(0 .. 1024);
-///     content[12] = 54;       // `content` derefs to a `&[u8]` or a `&mut [u8]`
+///     let content = mapped_memory.write(0..1024).unwrap();
+///     content[12] = 54;
 /// }
 /// ```
+#[derive(Debug)]
 pub struct MappedDeviceMemory {
     memory: DeviceMemory,
-    pointer: *mut c_void,
+    pointer: *mut c_void, // points to `range.start`
+    range: Range<DeviceSize>,
+
+    atom_size: DeviceAlignment,
     coherent: bool,
 }
 
@@ -702,70 +1197,280 @@ pub struct MappedDeviceMemory {
 //
 // Vulkan specs, documentation of `vkFreeMemory`:
 // > If a memory object is mapped at the time it is freed, it is implicitly unmapped.
-//
 
 impl MappedDeviceMemory {
+    /// Maps a range of memory to be accessed by the CPU.
+    ///
+    /// `memory` must be allocated from host-visible memory.
+    ///
+    /// `range` is specified in bytes relative to the start of the memory allocation, and must fall
+    /// within the range of the allocation (`0..allocation_size`). If `memory` was not allocated
+    /// from host-coherent memory, then the start and end of `range` must be a multiple of the
+    /// [`non_coherent_atom_size`](crate::device::Properties::non_coherent_atom_size) device
+    /// property, but `range.end` can also the memory's `allocation_size`.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if `range` is empty.
+    pub fn new(memory: DeviceMemory, range: Range<DeviceSize>) -> Result<Self, MemoryMapError> {
+        // VUID-vkMapMemory-size-00680
+        assert!(!range.is_empty());
+
+        // VUID-vkMapMemory-memory-00678
+        // Guaranteed because we take ownership of `memory`, no other mapping can exist.
+
+        // VUID-vkMapMemory-offset-00679
+        // VUID-vkMapMemory-size-00681
+        if range.end > memory.allocation_size {
+            return Err(MemoryMapError::OutOfRange {
+                provided_range: range,
+                allowed_range: 0..memory.allocation_size,
+            });
+        }
+
+        let device = memory.device();
+        let memory_type = &device.physical_device().memory_properties().memory_types
+            [memory.memory_type_index() as usize];
+
+        // VUID-vkMapMemory-memory-00682
+        if !memory_type
+            .property_flags
+            .intersects(MemoryPropertyFlags::HOST_VISIBLE)
+        {
+            return Err(MemoryMapError::NotHostVisible);
+        }
+
+        let coherent = memory_type
+            .property_flags
+            .intersects(MemoryPropertyFlags::HOST_COHERENT);
+        let atom_size = device.physical_device().properties().non_coherent_atom_size;
+
+        // Not required for merely mapping, but without this check the user can end up with
+        // parts of the mapped memory at the start and end that they're not able to
+        // invalidate/flush, which is probably unintended.
+        if !coherent
+            && (!is_aligned(range.start, atom_size)
+                || (!is_aligned(range.end, atom_size) && range.end != memory.allocation_size))
+        {
+            return Err(MemoryMapError::RangeNotAlignedToAtomSize { range, atom_size });
+        }
+
+        let pointer = unsafe {
+            let fns = device.fns();
+            let mut output = MaybeUninit::uninit();
+            (fns.v1_0.map_memory)(
+                device.handle(),
+                memory.handle,
+                range.start,
+                range.end - range.start,
+                ash::vk::MemoryMapFlags::empty(),
+                output.as_mut_ptr(),
+            )
+            .result()
+            .map_err(VulkanError::from)?;
+            output.assume_init()
+        };
+
+        Ok(MappedDeviceMemory {
+            memory,
+            pointer,
+            range,
+            atom_size,
+            coherent,
+        })
+    }
+
     /// Unmaps the memory. It will no longer be accessible from the CPU.
+    #[inline]
     pub fn unmap(self) -> DeviceMemory {
         unsafe {
             let device = self.memory.device();
             let fns = device.fns();
-            fns.v1_0
-                .unmap_memory(device.internal_object(), self.memory.memory);
+            (fns.v1_0.unmap_memory)(device.handle(), self.memory.handle);
         }
 
         self.memory
     }
 
-    /// Gives access to the content of the memory.
+    /// Invalidates the host (CPU) cache for a range of mapped memory.
     ///
-    /// This function takes care of calling `vkInvalidateMappedMemoryRanges` and
-    /// `vkFlushMappedMemoryRanges` on the given range. You are therefore encouraged to use the
-    /// smallest range as possible, and to not call this function multiple times in a row for
-    /// several small changes.
+    /// If the mapped memory is not host-coherent, you must call this function before the memory is
+    /// read by the host, if the device previously wrote to the memory. It has no effect if the
+    /// mapped memory is host-coherent.
+    ///
+    /// `range` is specified in bytes relative to the start of the memory allocation, and must fall
+    /// within the range of the memory mapping given to `new`. If the memory was not allocated
+    /// from host-coherent memory, then the start and end of `range` must be a multiple of the
+    /// [`non_coherent_atom_size`](crate::device::Properties::non_coherent_atom_size) device
+    /// property, but `range.end` can also equal the memory's `allocation_size`.
     ///
     /// # Safety
     ///
-    /// - Type safety is not checked. You must ensure that `T` corresponds to the content of the
-    ///   buffer.
-    /// - Accesses are not synchronized. Synchronization must be handled outside of
-    ///   the `MappedDeviceMemory`.
+    /// - If there are memory writes by the GPU that have not been propagated into the CPU cache,
+    ///   then there must not be any references in Rust code to the specified `range` of the memory.
     ///
+    /// # Panics
+    ///
+    /// - Panics if `range` is empty.
     #[inline]
-    pub unsafe fn read_write<T: ?Sized>(&self, range: Range<DeviceSize>) -> CpuAccess<T>
-    where
-        T: Content,
-    {
+    pub unsafe fn invalidate_range(&self, range: Range<DeviceSize>) -> Result<(), MemoryMapError> {
+        if self.coherent {
+            return Ok(());
+        }
+
+        self.check_range(range.clone())?;
+
+        // VUID-VkMappedMemoryRange-memory-00684
+        // Guaranteed because `self` owns the memory and it's mapped during our lifetime.
+
+        let range = ash::vk::MappedMemoryRange {
+            memory: self.memory.handle(),
+            offset: range.start,
+            size: range.end - range.start,
+            ..Default::default()
+        };
+
         let fns = self.memory.device().fns();
-        let pointer = T::ref_from_ptr(
-            (self.pointer as usize + range.start as usize) as *mut _,
+        (fns.v1_0.invalidate_mapped_memory_ranges)(self.memory.device().handle(), 1, &range)
+            .result()
+            .map_err(VulkanError::from)?;
+
+        Ok(())
+    }
+
+    /// Flushes the host (CPU) cache for a range of mapped memory.
+    ///
+    /// If the mapped memory is not host-coherent, you must call this function after writing to the
+    /// memory, if the device is going to read the memory. It has no effect if the
+    /// mapped memory is host-coherent.
+    ///
+    /// `range` is specified in bytes relative to the start of the memory allocation, and must fall
+    /// within the range of the memory mapping given to `map`. If the memory was not allocated
+    /// from host-coherent memory, then the start and end of `range` must be a multiple of the
+    /// [`non_coherent_atom_size`](crate::device::Properties::non_coherent_atom_size) device
+    /// property, but `range.end` can also equal the memory's `allocation_size`.
+    ///
+    /// # Safety
+    ///
+    /// - There must be no operations pending or executing in a GPU queue, that access the specified
+    ///   `range` of the memory.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if `range` is empty.
+    #[inline]
+    pub unsafe fn flush_range(&self, range: Range<DeviceSize>) -> Result<(), MemoryMapError> {
+        self.check_range(range.clone())?;
+
+        if self.coherent {
+            return Ok(());
+        }
+
+        // VUID-VkMappedMemoryRange-memory-00684
+        // Guaranteed because `self` owns the memory and it's mapped during our lifetime.
+
+        let range = ash::vk::MappedMemoryRange {
+            memory: self.memory.handle(),
+            offset: range.start,
+            size: range.end - range.start,
+            ..Default::default()
+        };
+
+        let fns = self.device().fns();
+        (fns.v1_0.flush_mapped_memory_ranges)(self.memory.device().handle(), 1, &range)
+            .result()
+            .map_err(VulkanError::from)?;
+
+        Ok(())
+    }
+
+    /// Returns a reference to bytes in the mapped memory.
+    ///
+    /// `range` is specified in bytes relative to the start of the memory allocation, and must fall
+    /// within the range of the memory mapping given to `map`. If the memory was not allocated
+    /// from host-coherent memory, then the start and end of `range` must be a multiple of the
+    /// [`non_coherent_atom_size`](crate::device::Properties::non_coherent_atom_size) device
+    /// property, but `range.end` can also equal the memory's `allocation_size`.
+    ///
+    /// # Safety
+    ///
+    /// - While the returned reference exists, there must not be any mutable references in Rust code
+    ///   to the same memory.
+    /// - While the returned reference exists, there must be no operations pending or executing in
+    ///   a GPU queue, that write to the same memory.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if `range` is empty.
+    #[inline]
+    pub unsafe fn read(&self, range: Range<DeviceSize>) -> Result<&[u8], MemoryMapError> {
+        self.check_range(range.clone())?;
+
+        let bytes = slice::from_raw_parts(
+            self.pointer.add((range.start - self.range.start) as usize) as *const u8,
             (range.end - range.start) as usize,
-        )
-        .unwrap(); // TODO: error
+        );
+
+        Ok(bytes)
+    }
+
+    /// Returns a mutable reference to bytes in the mapped memory.
+    ///
+    /// `range` is specified in bytes relative to the start of the memory allocation, and must fall
+    /// within the range of the memory mapping given to `map`. If the memory was not allocated
+    /// from host-coherent memory, then the start and end of `range` must be a multiple of the
+    /// [`non_coherent_atom_size`](crate::device::Properties::non_coherent_atom_size) device
+    /// property, but `range.end` can also equal the memory's `allocation_size`.
+    ///
+    /// # Safety
+    ///
+    /// - While the returned reference exists, there must not be any other references in Rust code
+    ///   to the same memory.
+    /// - While the returned reference exists, there must be no operations pending or executing in
+    ///   a GPU queue, that access the same memory.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if `range` is empty.
+    #[inline]
+    pub unsafe fn write(&self, range: Range<DeviceSize>) -> Result<&mut [u8], MemoryMapError> {
+        self.check_range(range.clone())?;
+
+        let bytes = slice::from_raw_parts_mut(
+            self.pointer.add((range.start - self.range.start) as usize) as *mut u8,
+            (range.end - range.start) as usize,
+        );
+
+        Ok(bytes)
+    }
+
+    #[inline]
+    fn check_range(&self, range: Range<DeviceSize>) -> Result<(), MemoryMapError> {
+        assert!(!range.is_empty());
+
+        // VUID-VkMappedMemoryRange-size-00685
+        if range.start < self.range.start || range.end > self.range.end {
+            return Err(MemoryMapError::OutOfRange {
+                provided_range: range,
+                allowed_range: self.range.clone(),
+            });
+        }
 
         if !self.coherent {
-            let range = ash::vk::MappedMemoryRange {
-                memory: self.memory.internal_object(),
-                offset: range.start,
-                size: range.end - range.start,
-                ..Default::default()
-            };
-
-            // TODO: return result instead?
-            check_errors(fns.v1_0.invalidate_mapped_memory_ranges(
-                self.memory.device().internal_object(),
-                1,
-                &range,
-            ))
-            .unwrap();
+            // VUID-VkMappedMemoryRange-offset-00687
+            // VUID-VkMappedMemoryRange-size-01390
+            if !is_aligned(range.start, self.atom_size)
+                || (!is_aligned(range.end, self.atom_size)
+                    && range.end != self.memory.allocation_size)
+            {
+                return Err(MemoryMapError::RangeNotAlignedToAtomSize {
+                    range,
+                    atom_size: self.atom_size,
+                });
+            }
         }
 
-        CpuAccess {
-            pointer: pointer,
-            mem: self,
-            coherent: self.coherent,
-            range,
-        }
+        Ok(())
     }
 }
 
@@ -793,314 +1498,122 @@ unsafe impl DeviceOwned for MappedDeviceMemory {
 unsafe impl Send for MappedDeviceMemory {}
 unsafe impl Sync for MappedDeviceMemory {}
 
-impl fmt::Debug for MappedDeviceMemory {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_tuple("MappedDeviceMemory")
-            .field(&self.memory)
-            .finish()
-    }
-}
-
-unsafe impl Send for DeviceMemoryMapping {}
-unsafe impl Sync for DeviceMemoryMapping {}
-
-/// Represents memory mapped in CPU accessible space.
-///
-/// Takes an additional reference on the underlying device memory and device.
-pub struct DeviceMemoryMapping {
-    device: Arc<Device>,
-    memory: Arc<DeviceMemory>,
-    pointer: *mut c_void,
-    coherent: bool,
-}
-
-impl DeviceMemoryMapping {
-    /// Creates a new `DeviceMemoryMapping` object given the previously allocated `device` and `memory`.
-    pub fn new(
-        device: Arc<Device>,
-        memory: Arc<DeviceMemory>,
-        offset: DeviceSize,
-        size: DeviceSize,
-        flags: u32,
-    ) -> Result<DeviceMemoryMapping, DeviceMemoryAllocError> {
-        // VUID-vkMapMemory-memory-00678: "memory must not be currently host mapped".
-        let mut mapped = memory.mapped.lock().expect("Poisoned mutex");
-
-        if *mapped {
-            return Err(DeviceMemoryAllocError::SpecViolation(678));
-        }
-
-        // VUID-vkMapMemory-offset-00679: "offset must be less than the size of memory"
-        if size != ash::vk::WHOLE_SIZE && offset >= memory.size() {
-            return Err(DeviceMemoryAllocError::SpecViolation(679));
-        }
-
-        // VUID-vkMapMemory-size-00680: "If size is not equal to VK_WHOLE_SIZE, size must be
-        // greater than 0".
-        if size != ash::vk::WHOLE_SIZE && size == 0 {
-            return Err(DeviceMemoryAllocError::SpecViolation(680));
-        }
-
-        // VUID-vkMapMemory-size-00681: "If size is not equal to VK_WHOLE_SIZE, size must be less
-        // than or equal to the size of the memory minus offset".
-        if size != ash::vk::WHOLE_SIZE && size > memory.size() - offset {
-            return Err(DeviceMemoryAllocError::SpecViolation(681));
-        }
-
-        // VUID-vkMapMemory-memory-00682: "memory must have been created with a memory type
-        // that reports VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT"
-        let coherent = memory.memory_type().is_host_coherent();
-        if !coherent {
-            return Err(DeviceMemoryAllocError::SpecViolation(682));
-        }
-
-        // VUID-vkMapMemory-memory-00683: "memory must not have been allocated with multiple instances".
-        // Confused about this one, so not implemented.
-
-        // VUID-vkMapMemory-memory-parent: "memory must have been created, allocated or retrieved
-        // from device"
-        if device.internal_object() != memory.device().internal_object() {
-            return Err(DeviceMemoryAllocError::ImplicitSpecViolation(
-                "VUID-vkMapMemory-memory-parent",
-            ));
-        }
-
-        // VUID-vkMapMemory-flags-zerobitmask: "flags must be 0".
-        if flags != 0 {
-            return Err(DeviceMemoryAllocError::ImplicitSpecViolation(
-                "VUID-vkMapMemory-flags-zerobitmask",
-            ));
-        }
-
-        // VUID-vkMapMemory-device-parameter, VUID-vkMapMemory-memory-parameter and
-        // VUID-vkMapMemory-ppData-parameter satisfied via Vulkano internally.
-
-        let fns = device.fns();
-        let ptr = unsafe {
-            let mut output = MaybeUninit::uninit();
-            check_errors(fns.v1_0.map_memory(
-                device.internal_object(),
-                memory.memory,
-                0,
-                memory.size,
-                ash::vk::MemoryMapFlags::empty(),
-                output.as_mut_ptr(),
-            ))?;
-            output.assume_init()
-        };
-
-        *mapped = true;
-
-        Ok(DeviceMemoryMapping {
-            device: device.clone(),
-            memory: memory.clone(),
-            pointer: ptr,
-            coherent,
-        })
-    }
-
-    /// Returns the raw pointer associated with the `DeviceMemoryMapping`.
-    ///
-    /// # Safety
-    ///
-    /// The caller of this function must ensure that the use of the raw pointer does not outlive
-    /// the associated `DeviceMemoryMapping`.
-    pub unsafe fn as_ptr(&self) -> *mut u8 {
-        self.pointer as *mut u8
-    }
-}
-
-impl Drop for DeviceMemoryMapping {
-    #[inline]
-    fn drop(&mut self) {
-        let mut mapped = self.memory.mapped.lock().expect("Poisoned mutex");
-
-        unsafe {
-            let fns = self.device.fns();
-            fns.v1_0
-                .unmap_memory(self.device.internal_object(), self.memory.memory);
-        }
-
-        *mapped = false;
-    }
-}
-
-/// Object that can be used to read or write the content of a `MappedDeviceMemory`.
-///
-/// This object derefs to the content, just like a `MutexGuard` for example.
-pub struct CpuAccess<'a, T: ?Sized + 'a> {
-    pointer: *mut T,
-    mem: &'a MappedDeviceMemory,
-    coherent: bool,
-    range: Range<DeviceSize>,
-}
-
-impl<'a, T: ?Sized + 'a> CpuAccess<'a, T> {
-    /// Builds a new `CpuAccess` to access a sub-part of the current `CpuAccess`.
-    ///
-    /// This function is unstable. Don't use it directly.
-    // TODO: unsafe?
-    // TODO: decide what to do with this
-    #[doc(hidden)]
-    #[inline]
-    pub fn map<U: ?Sized + 'a, F>(self, f: F) -> CpuAccess<'a, U>
-    where
-        F: FnOnce(*mut T) -> *mut U,
-    {
-        CpuAccess {
-            pointer: f(self.pointer),
-            mem: self.mem,
-            coherent: self.coherent,
-            range: self.range.clone(), // TODO: ?
-        }
-    }
-}
-
-unsafe impl<'a, T: ?Sized + 'a> Send for CpuAccess<'a, T> {}
-unsafe impl<'a, T: ?Sized + 'a> Sync for CpuAccess<'a, T> {}
-
-impl<'a, T: ?Sized + 'a> Deref for CpuAccess<'a, T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &T {
-        unsafe { &*self.pointer }
-    }
-}
-
-impl<'a, T: ?Sized + 'a> DerefMut for CpuAccess<'a, T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.pointer }
-    }
-}
-
-impl<'a, T: ?Sized + 'a> Drop for CpuAccess<'a, T> {
-    #[inline]
-    fn drop(&mut self) {
-        // If the memory doesn't have the `coherent` flag, we need to flush the data.
-        if !self.coherent {
-            let fns = self.mem.as_ref().device().fns();
-
-            let range = ash::vk::MappedMemoryRange {
-                memory: self.mem.as_ref().internal_object(),
-                offset: self.range.start,
-                size: self.range.end - self.range.start,
-                ..Default::default()
-            };
-
-            unsafe {
-                check_errors(fns.v1_0.flush_mapped_memory_ranges(
-                    self.mem.as_ref().device().internal_object(),
-                    1,
-                    &range,
-                ))
-                .unwrap();
-            }
-        }
-    }
-}
-
 /// Error type returned by functions related to `DeviceMemory`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum DeviceMemoryAllocError {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryMapError {
     /// Not enough memory available.
     OomError(OomError),
-    /// The maximum number of allocations has been exceeded.
-    TooManyObjects,
+
     /// Memory map failed.
     MemoryMapFailed,
-    /// Invalid Memory Index
-    MemoryIndexInvalid,
-    /// Invalid Structure Type
-    StructureTypeAlreadyPresent,
-    /// Spec violation, containing the Valid Usage ID (VUID) from the Vulkan spec.
-    SpecViolation(u32),
-    /// An implicit violation that's convered in the Vulkan spec.
-    ImplicitSpecViolation(&'static str),
-    /// An extension is missing.
-    MissingExtension(&'static str),
-    /// Invalid Size
-    InvalidSize,
+
+    /// Tried to map memory whose type is not host-visible.
+    NotHostVisible,
+
+    /// The specified `range` is not contained within the allocated or mapped memory range.
+    OutOfRange {
+        provided_range: Range<DeviceSize>,
+        allowed_range: Range<DeviceSize>,
+    },
+
+    /// The memory is not host-coherent, and the specified `range` bounds are not a multiple of the
+    /// [`non_coherent_atom_size`](crate::device::Properties::non_coherent_atom_size) device
+    /// property.
+    RangeNotAlignedToAtomSize {
+        range: Range<DeviceSize>,
+        atom_size: DeviceAlignment,
+    },
 }
 
-impl error::Error for DeviceMemoryAllocError {
-    #[inline]
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
-            DeviceMemoryAllocError::OomError(ref err) => Some(err),
+impl Error for MemoryMapError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::OomError(err) => Some(err),
             _ => None,
         }
     }
 }
 
-impl fmt::Display for DeviceMemoryAllocError {
-    #[inline]
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        match *self {
-            DeviceMemoryAllocError::OomError(_) => write!(fmt, "not enough memory available"),
-            DeviceMemoryAllocError::TooManyObjects => {
-                write!(fmt, "the maximum number of allocations has been exceeded")
+impl Display for MemoryMapError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
+        match self {
+            Self::OomError(_) => write!(f, "not enough memory available"),
+            Self::MemoryMapFailed => write!(f, "memory map failed"),
+            Self::NotHostVisible => {
+                write!(f, "tried to map memory whose type is not host-visible")
             }
-            DeviceMemoryAllocError::MemoryMapFailed => write!(fmt, "memory map failed"),
-            DeviceMemoryAllocError::MemoryIndexInvalid => write!(fmt, "memory index invalid"),
-            DeviceMemoryAllocError::StructureTypeAlreadyPresent => {
-                write!(fmt, "structure type already present")
-            }
-            DeviceMemoryAllocError::SpecViolation(u) => {
-                write!(fmt, "valid usage ID check {} failed", u)
-            }
-            DeviceMemoryAllocError::MissingExtension(s) => {
-                write!(fmt, "Missing the following extension: {}", s)
-            }
-            DeviceMemoryAllocError::ImplicitSpecViolation(e) => {
-                write!(fmt, "Implicit spec violation failed {}", e)
-            }
-            DeviceMemoryAllocError::InvalidSize => write!(fmt, "invalid size"),
+            Self::OutOfRange {
+                provided_range,
+                allowed_range,
+            } => write!(
+                f,
+                "the specified `range` ({:?}) was not contained within the allocated or mapped \
+                memory range ({:?})",
+                provided_range, allowed_range,
+            ),
+            Self::RangeNotAlignedToAtomSize { range, atom_size } => write!(
+                f,
+                "the memory is not host-coherent, and the specified `range` bounds ({:?}) are not \
+                a multiple of the `non_coherent_atom_size` device property ({:?})",
+                range, atom_size,
+            ),
         }
     }
 }
 
-impl From<Error> for DeviceMemoryAllocError {
-    #[inline]
-    fn from(err: Error) -> DeviceMemoryAllocError {
+impl From<VulkanError> for MemoryMapError {
+    fn from(err: VulkanError) -> Self {
         match err {
-            e @ Error::OutOfHostMemory | e @ Error::OutOfDeviceMemory => {
-                DeviceMemoryAllocError::OomError(e.into())
+            e @ VulkanError::OutOfHostMemory | e @ VulkanError::OutOfDeviceMemory => {
+                Self::OomError(e.into())
             }
-            Error::TooManyObjects => DeviceMemoryAllocError::TooManyObjects,
-            Error::MemoryMapFailed => DeviceMemoryAllocError::MemoryMapFailed,
+            VulkanError::MemoryMapFailed => Self::MemoryMapFailed,
             _ => panic!("unexpected error: {:?}", err),
         }
     }
 }
 
-impl From<OomError> for DeviceMemoryAllocError {
-    #[inline]
-    fn from(err: OomError) -> DeviceMemoryAllocError {
-        DeviceMemoryAllocError::OomError(err)
+impl From<OomError> for MemoryMapError {
+    fn from(err: OomError) -> Self {
+        Self::OomError(err)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::memory::DeviceMemory;
-    use crate::memory::DeviceMemoryAllocError;
-    use crate::OomError;
+    use super::MemoryAllocateInfo;
+    use crate::{
+        memory::{DeviceMemory, DeviceMemoryError, MemoryPropertyFlags},
+        OomError,
+    };
 
     #[test]
     fn create() {
         let (device, _) = gfx_dev_and_queue!();
-        let mem_ty = device.physical_device().memory_types().next().unwrap();
-        let _ = DeviceMemory::alloc(device.clone(), mem_ty, 256).unwrap();
+        let _ = DeviceMemory::allocate(
+            device,
+            MemoryAllocateInfo {
+                allocation_size: 256,
+                memory_type_index: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     #[test]
     fn zero_size() {
         let (device, _) = gfx_dev_and_queue!();
-        let mem_ty = device.physical_device().memory_types().next().unwrap();
         assert_should_panic!({
-            let _ = DeviceMemory::alloc(device.clone(), mem_ty, 0).unwrap();
+            let _ = DeviceMemory::allocate(
+                device.clone(),
+                MemoryAllocateInfo {
+                    allocation_size: 0,
+                    memory_type_index: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         });
     }
 
@@ -1108,15 +1621,28 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     fn oom_single() {
         let (device, _) = gfx_dev_and_queue!();
-        let mem_ty = device
+        let memory_type_index = device
             .physical_device()
-            .memory_types()
-            .filter(|m| !m.is_lazily_allocated())
-            .next()
+            .memory_properties()
+            .memory_types
+            .iter()
+            .enumerate()
+            .find_map(|(i, m)| {
+                (!m.property_flags
+                    .intersects(MemoryPropertyFlags::LAZILY_ALLOCATED))
+                .then_some(i as u32)
+            })
             .unwrap();
 
-        match DeviceMemory::alloc(device.clone(), mem_ty, 0xffffffffffffffff) {
-            Err(DeviceMemoryAllocError::SpecViolation(u)) => (),
+        match DeviceMemory::allocate(
+            device,
+            MemoryAllocateInfo {
+                allocation_size: 0xffffffffffffffff,
+                memory_type_index,
+                ..Default::default()
+            },
+        ) {
+            Err(DeviceMemoryError::MemoryTypeHeapSizeExceeded { .. }) => (),
             _ => panic!(),
         }
     }
@@ -1125,19 +1651,34 @@ mod tests {
     #[ignore] // TODO: test fails for now on Mesa+Intel
     fn oom_multi() {
         let (device, _) = gfx_dev_and_queue!();
-        let mem_ty = device
+        let (memory_type_index, memory_type) = device
             .physical_device()
-            .memory_types()
-            .filter(|m| !m.is_lazily_allocated())
-            .next()
+            .memory_properties()
+            .memory_types
+            .iter()
+            .enumerate()
+            .find_map(|(i, m)| {
+                (!m.property_flags
+                    .intersects(MemoryPropertyFlags::LAZILY_ALLOCATED))
+                .then_some((i as u32, m))
+            })
             .unwrap();
-        let heap_size = mem_ty.heap().size();
+        let heap_size = device.physical_device().memory_properties().memory_heaps
+            [memory_type.heap_index as usize]
+            .size;
 
         let mut allocs = Vec::new();
 
         for _ in 0..4 {
-            match DeviceMemory::alloc(device.clone(), mem_ty, heap_size / 3) {
-                Err(DeviceMemoryAllocError::OomError(OomError::OutOfDeviceMemory)) => return, // test succeeded
+            match DeviceMemory::allocate(
+                device.clone(),
+                MemoryAllocateInfo {
+                    allocation_size: heap_size / 3,
+                    memory_type_index,
+                    ..Default::default()
+                },
+            ) {
+                Err(DeviceMemoryError::OomError(OomError::OutOfDeviceMemory)) => return, // test succeeded
                 Ok(a) => allocs.push(a),
                 _ => (),
             }
@@ -1149,14 +1690,29 @@ mod tests {
     #[test]
     fn allocation_count() {
         let (device, _) = gfx_dev_and_queue!();
-        let mem_ty = device.physical_device().memory_types().next().unwrap();
-        assert_eq!(*device.allocation_count().lock().unwrap(), 0);
-        let mem1 = DeviceMemory::alloc(device.clone(), mem_ty, 256).unwrap();
-        assert_eq!(*device.allocation_count().lock().unwrap(), 1);
+        assert_eq!(device.allocation_count(), 0);
+        let _mem1 = DeviceMemory::allocate(
+            device.clone(),
+            MemoryAllocateInfo {
+                allocation_size: 256,
+                memory_type_index: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(device.allocation_count(), 1);
         {
-            let mem2 = DeviceMemory::alloc(device.clone(), mem_ty, 256).unwrap();
-            assert_eq!(*device.allocation_count().lock().unwrap(), 2);
+            let _mem2 = DeviceMemory::allocate(
+                device.clone(),
+                MemoryAllocateInfo {
+                    allocation_size: 256,
+                    memory_type_index: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(device.allocation_count(), 2);
         }
-        assert_eq!(*device.allocation_count().lock().unwrap(), 1);
+        assert_eq!(device.allocation_count(), 1);
     }
 }
