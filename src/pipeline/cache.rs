@@ -18,20 +18,16 @@
 //! doesn't exist.
 //!
 //! Once that is done, you can extract the data from the cache and store it. See the documentation
-//! of [`get_data`](struct.PipelineCache.html#method.get_data) for example of how to store the data
-//! on the disk, and [`with_data`](struct.PipelineCache.html#method.with_data) for how to reload it.
+//! of [`get_data`](crate::pipeline::cache::PipelineCache::get_data) for example of how to store the data
+//! on the disk, and [`with_data`](crate::pipeline::cache::PipelineCache::with_data) for how to reload it.
 
-use crate::check_errors;
-use crate::device::Device;
-use crate::OomError;
-use crate::VulkanObject;
-use std::mem::MaybeUninit;
-use std::ptr;
-use std::sync::Arc;
+use crate::{device::Device, OomError, VulkanError, VulkanObject};
+use std::{mem::MaybeUninit, ptr, sync::Arc};
 
 /// Opaque cache that contains pipeline objects.
 ///
-/// See [the documentation of the module](index.html) for more info.
+/// See [the documentation of the module](crate::pipeline::cache) for more info.
+#[derive(Debug)]
 pub struct PipelineCache {
     device: Arc<Device>,
     cache: ash::vk::PipelineCache,
@@ -45,7 +41,7 @@ impl PipelineCache {
     /// implementation. Therefore you can easily crash your application or the system by passing
     /// wrong data. Hence why this function is unsafe.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// This example loads a cache from a file, if it exists.
     /// See [`get_data`](#method.get_data) for how to store the data in a file.
@@ -65,8 +61,12 @@ impl PipelineCache {
     ///         let mut data = Vec::new();
     ///         if let Ok(_) = file.read_to_end(&mut data) {
     ///             Some(data)
-    ///         } else { None }
-    ///     } else { None }
+    ///         } else {
+    ///             None
+    ///         }
+    ///     } else {
+    ///         None
+    ///     }
     /// };
     ///
     /// let cache = if let Some(data) = data {
@@ -86,7 +86,7 @@ impl PipelineCache {
 
     /// Builds a new empty pipeline cache.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -118,18 +118,20 @@ impl PipelineCache {
             };
 
             let mut output = MaybeUninit::uninit();
-            check_errors(fns.v1_0.create_pipeline_cache(
-                device.internal_object(),
+            (fns.v1_0.create_pipeline_cache)(
+                device.handle(),
                 &infos,
                 ptr::null(),
                 output.as_mut_ptr(),
-            ))?;
+            )
+            .result()
+            .map_err(VulkanError::from)?;
             output.assume_init()
         };
 
         Ok(Arc::new(PipelineCache {
             device: device.clone(),
-            cache: cache,
+            cache,
         }))
     }
 
@@ -137,33 +139,35 @@ impl PipelineCache {
     ///
     /// It is `self` that is modified here. The pipeline caches passed as parameter are untouched.
     ///
-    /// # Panic
+    /// # Panics
     ///
     /// - Panics if `self` is included in the list of other pipelines.
     ///
     // FIXME: vkMergePipelineCaches is not thread safe for the destination cache
     // TODO: write example
-    pub fn merge<'a, I>(&self, pipelines: I) -> Result<(), OomError>
-    where
-        I: IntoIterator<Item = &'a &'a Arc<PipelineCache>>,
-    {
+    pub fn merge<'a>(
+        &self,
+        pipelines: impl IntoIterator<Item = &'a &'a Arc<PipelineCache>>,
+    ) -> Result<(), OomError> {
         unsafe {
             let fns = self.device.fns();
 
             let pipelines = pipelines
                 .into_iter()
                 .map(|pipeline| {
-                    assert!(&***pipeline as *const _ != &*self as *const _);
+                    assert!(&***pipeline as *const _ != self as *const _);
                     pipeline.cache
                 })
                 .collect::<Vec<_>>();
 
-            check_errors(fns.v1_0.merge_pipeline_caches(
-                self.device.internal_object(),
+            (fns.v1_0.merge_pipeline_caches)(
+                self.device.handle(),
                 self.cache,
                 pipelines.len() as u32,
                 pipelines.as_ptr(),
-            ))?;
+            )
+            .result()
+            .map_err(VulkanError::from)?;
 
             Ok(())
         }
@@ -173,7 +177,7 @@ impl PipelineCache {
     ///
     /// This data can be stored and then reloaded and passed to `PipelineCache::with_data`.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// This example stores the data of a pipeline cache on the disk.
     /// See [`with_data`](#method.with_data) for how to reload it.
@@ -197,37 +201,50 @@ impl PipelineCache {
     ///     }
     /// }
     /// ```
+    #[inline]
     pub fn get_data(&self) -> Result<Vec<u8>, OomError> {
-        unsafe {
-            let fns = self.device.fns();
+        let fns = self.device.fns();
 
-            let mut num = 0;
-            check_errors(fns.v1_0.get_pipeline_cache_data(
-                self.device.internal_object(),
-                self.cache,
-                &mut num,
-                ptr::null_mut(),
-            ))?;
+        let data = unsafe {
+            loop {
+                let mut count = 0;
+                (fns.v1_0.get_pipeline_cache_data)(
+                    self.device.handle(),
+                    self.cache,
+                    &mut count,
+                    ptr::null_mut(),
+                )
+                .result()
+                .map_err(VulkanError::from)?;
 
-            let mut data: Vec<u8> = Vec::with_capacity(num as usize);
-            check_errors(fns.v1_0.get_pipeline_cache_data(
-                self.device.internal_object(),
-                self.cache,
-                &mut num,
-                data.as_mut_ptr() as *mut _,
-            ))?;
-            data.set_len(num as usize);
+                let mut data: Vec<u8> = Vec::with_capacity(count);
+                let result = (fns.v1_0.get_pipeline_cache_data)(
+                    self.device.handle(),
+                    self.cache,
+                    &mut count,
+                    data.as_mut_ptr() as *mut _,
+                );
 
-            Ok(data)
-        }
+                match result {
+                    ash::vk::Result::SUCCESS => {
+                        data.set_len(count);
+                        break data;
+                    }
+                    ash::vk::Result::INCOMPLETE => (),
+                    err => return Err(VulkanError::from(err).into()),
+                }
+            }
+        };
+
+        Ok(data)
     }
 }
 
 unsafe impl VulkanObject for PipelineCache {
-    type Object = ash::vk::PipelineCache;
+    type Handle = ash::vk::PipelineCache;
 
     #[inline]
-    fn internal_object(&self) -> ash::vk::PipelineCache {
+    fn handle(&self) -> Self::Handle {
         self.cache
     }
 }
@@ -237,23 +254,21 @@ impl Drop for PipelineCache {
     fn drop(&mut self) {
         unsafe {
             let fns = self.device.fns();
-            fns.v1_0
-                .destroy_pipeline_cache(self.device.internal_object(), self.cache, ptr::null());
+            (fns.v1_0.destroy_pipeline_cache)(self.device.handle(), self.cache, ptr::null());
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::pipeline::cache::PipelineCache;
-    use crate::pipeline::shader::ShaderModule;
-    use crate::pipeline::shader::SpecializationConstants;
-    use crate::pipeline::ComputePipeline;
-    use std::{ffi::CStr, sync::Arc};
+    use crate::{
+        pipeline::{cache::PipelineCache, ComputePipeline},
+        shader::ShaderModule,
+    };
 
     #[test]
     fn merge_self_forbidden() {
-        let (device, queue) = gfx_dev_and_queue!();
+        let (device, _queue) = gfx_dev_and_queue!();
         let pipeline = PipelineCache::empty(device).unwrap();
         assert_should_panic!({
             pipeline.merge(&[&pipeline]).unwrap();
@@ -262,7 +277,7 @@ mod tests {
 
     #[test]
     fn cache_returns_same_data() {
-        let (device, queue) = gfx_dev_and_queue!();
+        let (device, _queue) = gfx_dev_and_queue!();
 
         let cache = PipelineCache::empty(device.clone()).unwrap();
 
@@ -282,22 +297,17 @@ mod tests {
                 0, 0, 0, 54, 0, 5, 0, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 248, 0, 2, 0,
                 5, 0, 0, 0, 253, 0, 1, 0, 56, 0, 1, 0,
             ];
-            ShaderModule::new(device.clone(), &MODULE).unwrap()
+            ShaderModule::from_bytes(device.clone(), &MODULE).unwrap()
         };
 
-        let shader = unsafe {
-            static NAME: [u8; 5] = [109, 97, 105, 110, 0]; // "main"
-            module.compute_entry_point(
-                CStr::from_ptr(NAME.as_ptr() as *const _),
-                [],
-                None,
-                <()>::descriptors(),
-            )
-        };
-
-        let pipeline = Arc::new(
-            ComputePipeline::new(device.clone(), &shader, &(), Some(cache.clone())).unwrap(),
-        );
+        let _pipeline = ComputePipeline::new(
+            device,
+            module.entry_point("main").unwrap(),
+            &(),
+            Some(cache.clone()),
+            |_| {},
+        )
+        .unwrap();
 
         let cache_data = cache.get_data().unwrap();
         let second_data = cache.get_data().unwrap();
@@ -307,7 +317,7 @@ mod tests {
 
     #[test]
     fn cache_returns_different_data() {
-        let (device, queue) = gfx_dev_and_queue!();
+        let (device, _queue) = gfx_dev_and_queue!();
 
         let cache = PipelineCache::empty(device.clone()).unwrap();
 
@@ -327,17 +337,7 @@ mod tests {
                 0, 0, 0, 54, 0, 5, 0, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 248, 0, 2, 0,
                 5, 0, 0, 0, 253, 0, 1, 0, 56, 0, 1, 0,
             ];
-            ShaderModule::new(device.clone(), &MODULE).unwrap()
-        };
-
-        let first_shader = unsafe {
-            static NAME: [u8; 5] = [109, 97, 105, 110, 0]; // "main"
-            first_module.compute_entry_point(
-                CStr::from_ptr(NAME.as_ptr() as *const _),
-                [],
-                None,
-                <()>::descriptors(),
-            )
+            ShaderModule::from_bytes(device.clone(), &MODULE).unwrap()
         };
 
         let second_module = unsafe {
@@ -368,28 +368,28 @@ mod tests {
                 0, 15, 0, 0, 0, 14, 0, 0, 0, 62, 0, 3, 0, 8, 0, 0, 0, 15, 0, 0, 0, 253, 0, 1, 0,
                 56, 0, 1, 0,
             ];
-            ShaderModule::new(device.clone(), &SECOND_MODULE).unwrap()
+            ShaderModule::from_bytes(device.clone(), &SECOND_MODULE).unwrap()
         };
 
-        let second_shader = unsafe {
-            static NAME: [u8; 5] = [109, 97, 105, 110, 0]; // "main"
-            second_module.compute_entry_point(
-                CStr::from_ptr(NAME.as_ptr() as *const _),
-                [],
-                None,
-                <()>::descriptors(),
-            )
-        };
-
-        let pipeline = Arc::new(
-            ComputePipeline::new(device.clone(), &first_shader, &(), Some(cache.clone())).unwrap(),
-        );
+        let _pipeline = ComputePipeline::new(
+            device.clone(),
+            first_module.entry_point("main").unwrap(),
+            &(),
+            Some(cache.clone()),
+            |_| {},
+        )
+        .unwrap();
 
         let cache_data = cache.get_data().unwrap();
 
-        let second_pipeline = Arc::new(
-            ComputePipeline::new(device.clone(), &second_shader, &(), Some(cache.clone())).unwrap(),
-        );
+        let _second_pipeline = ComputePipeline::new(
+            device,
+            second_module.entry_point("main").unwrap(),
+            &(),
+            Some(cache.clone()),
+            |_| {},
+        )
+        .unwrap();
 
         let second_data = cache.get_data().unwrap();
 
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn cache_data_does_not_change() {
-        let (device, queue) = gfx_dev_and_queue!();
+        let (device, _queue) = gfx_dev_and_queue!();
 
         let cache = PipelineCache::empty(device.clone()).unwrap();
 
@@ -422,28 +422,28 @@ mod tests {
                 0, 0, 0, 54, 0, 5, 0, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 248, 0, 2, 0,
                 5, 0, 0, 0, 253, 0, 1, 0, 56, 0, 1, 0,
             ];
-            ShaderModule::new(device.clone(), &MODULE).unwrap()
+            ShaderModule::from_bytes(device.clone(), &MODULE).unwrap()
         };
 
-        let shader = unsafe {
-            static NAME: [u8; 5] = [109, 97, 105, 110, 0]; // "main"
-            module.compute_entry_point(
-                CStr::from_ptr(NAME.as_ptr() as *const _),
-                [],
-                None,
-                <()>::descriptors(),
-            )
-        };
-
-        let pipeline = Arc::new(
-            ComputePipeline::new(device.clone(), &shader, &(), Some(cache.clone())).unwrap(),
-        );
+        let _pipeline = ComputePipeline::new(
+            device.clone(),
+            module.entry_point("main").unwrap(),
+            &(),
+            Some(cache.clone()),
+            |_| {},
+        )
+        .unwrap();
 
         let cache_data = cache.get_data().unwrap();
 
-        let second_pipeline = Arc::new(
-            ComputePipeline::new(device.clone(), &shader, &(), Some(cache.clone())).unwrap(),
-        );
+        let _second_pipeline = ComputePipeline::new(
+            device,
+            module.entry_point("main").unwrap(),
+            &(),
+            Some(cache.clone()),
+            |_| {},
+        )
+        .unwrap();
 
         let second_data = cache.get_data().unwrap();
 
