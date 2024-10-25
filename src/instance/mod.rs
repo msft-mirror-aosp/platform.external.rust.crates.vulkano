@@ -792,7 +792,7 @@ impl InstanceCreateInfo {
     #[inline]
     pub fn application_from_cargo_toml() -> Self {
         Self {
-            application_name: Some("vulkano".to_owned()),
+            application_name: Some(env!("CARGO_PKG_NAME").to_owned()),
             application_version: Version {
                 major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
                 minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
